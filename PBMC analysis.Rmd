@@ -14,7 +14,7 @@ Mval<-function(beta) log2(beta/(1-beta))
 PBMC have 108 samples(excludes the missing samples) collected from 9 individuals.
 each exposure corresponds to three time point: before exposure, 24 hours after expsoure and 48 hours after expsoure 
 
-**to potentionally simplify things, we will compare the methylation profile of the 24 hr and 48 hr samples first
+**to potentionally simplify things, we will compare the methylation profile of the 24 hr and 48 hr samples first**
 # compare methylation profile of the 24 hr and 48 hr samples using the invariable probes filtered betas
 ```{r}
 load("DE3meta.RData") # filtermeta
