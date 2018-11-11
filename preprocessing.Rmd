@@ -1,0 +1,506 @@
+---
+title: "diesel"
+author: "cyou"
+date: "1/16/2018"
+output: html_document
+---
+DE3 Analysis: Pre-Processing and Normalization
+========================
+
+This project is looking at the effects of diesel exhaust and allergen exposure in humans on methylation in bronchial epithelial cells (BRUSH), nasal epithelial cells, bronchoalveolar lavage/ bronchoalveolar washing (cells from the airway space aka BAL), peripheral blood mononuclear cell (PBMC) 
+
+
+```{r setup, include=FALSE}
+library(knitr)
+
+library(methylumi)
+library(wateRmelon)
+library(RPMM)
+library("ggsci")
+library(dendextend)
+library(RColorBrewer)
+library(ggplot2)
+library(dplyr)
+library("sva")
+library(parallel)
+library(gridExtra)
+library(grid)
+library("reshape2")
+library(limma)
+library(FlowSorted.Blood.450k)
+library(minfi)
+library(IlluminaHumanMethylation450kmanifest)
+library(quadprog)
+
+setwd("~/DE3")
+```
+
+some functions that will be used for later
+*courtesy of Rachel Edgar
+```{r}
+## heat scree for categorical variables
+heat_scree_plot<-function(Loadings, Importance){
+  adjust<-1-Importance[1]
+  pca_adjusted<-Importance[2:length(Importance)]/adjust
+  pca_df<-data.frame(adjusted_variance=pca_adjusted, PC=seq(1:length(pca_adjusted)))
+  
+  scree<-ggplot(pca_df[which(pca_df$PC<16),],aes(PC,adjusted_variance))+geom_bar(stat = "identity",color="black",fill="grey")+theme_bw()+
+        theme(axis.text = element_text(size =12),
+              axis.title = element_text(size =15),
+              plot.margin=unit(c(1.25,1.6,0.2,3),"cm"))+ylab("Adjusted Variance")+
+    scale_x_continuous(breaks = seq(1,15,1))
+  
+  
+  #### Heat
+  ## correlate meta with PCS
+  ## Run anova of each PC on each meta data variable
+
+aov_PC_meta <- lapply(1:ncol(meta_categorical), function(covar) sapply(1:ncol(Loadings),function(PC) summary(aov(Loadings[, PC] ~ meta_categorical[, covar]))[[1]]$"Pr(>F)"[1]))
+
+  
+ names(aov_PC_meta) <- colnames(meta_categorical)
+    aov_PC_meta <- do.call(rbind, aov_PC_meta)
+    aov_PC_meta <- as.data.frame(aov_PC_meta)
+  
+  #adjust
+  aov_PC_meta_adjust<-aov_PC_meta[,2:ncol(aov_PC_meta)]
+    
+  #reshape
+  avo<-aov_PC_meta_adjust[,1:15]
+  avo_heat_num<-apply(avo,2, as.numeric)
+  avo_heat<-as.data.frame(avo_heat_num)
+  avo_heat$meta<-rownames(avo)
+  avo_heat_melt<-melt(avo_heat, id=c("meta"))
+  
+  # cluster meta data
+  ord <- c(1:length(meta_categorical))
+  meta_var_order<-unique(avo_heat_melt$meta)[rev(ord)]
+  avo_heat_melt$meta <- factor(avo_heat_melt$meta, levels = meta_var_order)
+  
+  # color if sig
+  avo_heat_melt$Pvalue<-sapply(1:nrow(avo_heat_melt), function(x) if(avo_heat_melt$value[x]<=0.001){"<=0.001"}else{
+    if(avo_heat_melt$value[x]<=0.01){"<=0.01"}else{
+      if(avo_heat_melt$value[x]<=0.05){"<=0.05"}else{">0.05"}}})
+  
+  heat<-ggplot(avo_heat_melt, aes(variable,meta, fill = Pvalue)) +
+  geom_tile(color = "black",size=0.5) +
+  theme_gray(8)+scale_fill_manual(values=c("#084594","#4292c6","#9ecae1","#deebf7"))+
+      theme(axis.text = element_text(size =10, color="black"),
+            axis.text.x = element_text(),
+          axis.title = element_text(size =15),
+          legend.text = element_text(size =14),
+          legend.title = element_text(size =12),
+          legend.position = c(1, 0.4), legend.justification = c(1,1),
+          plot.margin=unit(c(0,2.25,1,1),"cm"))+
+    xlab("Adjusted principal Component")+ylab(NULL)
+    grid.arrange(scree, heat, ncol=1,heights = c(3, 4))
+}
+
+## heat scree for continuous variables
+heat_scree_plot1<-function(Loadings, Importance){
+  adjust<-1-Importance[1]
+  pca_adjusted<-Importance[2:length(Importance)]/adjust
+  pca_df<-data.frame(adjusted_variance=pca_adjusted, PC=seq(1:length(pca_adjusted)))
+  
+  scree<-ggplot(pca_df[which(pca_df$PC<16),],aes(PC,adjusted_variance))+geom_bar(stat = "identity",color="black",fill="grey")+theme_bw()+
+        theme(axis.text = element_text(size =12),
+              axis.title = element_text(size =15),
+              plot.margin=unit(c(1.25,1.6,0.2,3),"cm"))+ylab("Adjusted Variance")+
+    scale_x_continuous(breaks = seq(1,15,1))
+  
+  
+  #### Heat
+  ## correlate meta with PCS
+  ## Run anova of each PC on each meta data variable
+
+#aov_PC_meta <- lapply(1:ncol(meta_categorical), function(covar) sapply(1:ncol(Loadings),function(PC) summary(aov(Loadings[, PC] ~ meta_categorical[, covar]))[[1]]$"Pr(>F)"[1]))
+
+  cor_PC_meta <- lapply(1:ncol(meta_continuous), function(covar) sapply(1:ncol(Loadings), 
+        function(PC) (cor.test(Loadings[, PC], as.numeric(meta_continuous[, 
+            covar]), alternative = "two.sided", method = "spearman", na.action = na.omit)$p.value)))
+ 
+ # names(aov_PC_meta) <- colnames(meta_categorical)
+    names(cor_PC_meta) <- colnames(meta_continuous)
+ #  aov_PC_meta <- do.call(rbind, aov_PC_meta)
+   cor_PC_meta <- do.call(rbind, cor_PC_meta)
+  #  aov_PC_meta <- rbind(aov_PC_meta, cor_PC_meta)
+    aov_PC_meta <- as.data.frame(cor_PC_meta)
+  
+  #adjust
+  aov_PC_meta_adjust<-aov_PC_meta[,2:ncol(aov_PC_meta)]
+    
+  #reshape
+  avo<-aov_PC_meta_adjust[,1:15]
+  avo_heat_num<-apply(avo,2, as.numeric)
+  avo_heat<-as.data.frame(avo_heat_num)
+  avo_heat$meta<-rownames(avo)
+  avo_heat_melt<-melt(avo_heat, id=c("meta"))
+  
+  # cluster meta data
+  ord <- c(1:length(meta_continuous))
+  meta_var_order<-unique(avo_heat_melt$meta)[rev(ord)]
+  avo_heat_melt$meta <- factor(avo_heat_melt$meta, levels = meta_var_order)
+  
+  # color if sig
+  avo_heat_melt$Pvalue<-sapply(1:nrow(avo_heat_melt), function(x) if(avo_heat_melt$value[x]<=0.001){"<=0.001"}else{
+    if(avo_heat_melt$value[x]<=0.01){"<=0.01"}else{
+      if(avo_heat_melt$value[x]<=0.05){"<=0.05"}else{">0.05"}}})
+  
+  heat<-ggplot(avo_heat_melt, aes(variable,meta, fill = Pvalue)) +
+  geom_tile(color = "black",size=0.5) +
+  theme_gray(8)+scale_fill_manual(values=c("#084594","#4292c6","#9ecae1","#deebf7"))+
+      theme(axis.text = element_text(size =10, color="black"),
+            axis.text.x = element_text(),
+          axis.title = element_text(size =15),
+          legend.text = element_text(size =14),
+          legend.title = element_text(size =12),
+          legend.position = c(1, 0.4), legend.justification = c(1,1),
+          plot.margin=unit(c(0,2.25,1,1),"cm"))+
+    xlab("Adjusted principal Component")+ylab(NULL)
+  
+  #grid.arrange(scree, heat, ncol=1, widths = c(4, 1), heights = c(2, 4))
+    grid.arrange(scree, heat, ncol=1,heights = c(3, 4))#
+}
+```
+
+## Load the data from Genome Studio and make methylumi objects
+```{r,eval=F, echo=T}
+allFile <- ("/home/cyou/DE3/DE3-alldata.txt") 
+qcFile <-  ("/home/cyou/DE3/DE3-qcfile.txt")
+
+#Producing the lumi objects
+de3<- lumiMethyR(allFile)
+de3.2 <- methylumiR(allFile, qcfile = qcFile)
+save(de3,de3.2, file="de3_methylumi.RData")
+dim(betas(de3.2)) # #CpGs/probes=865918 #samples=232
+```
+There are **865,918** probes with **232** samples.
+
+
+## Read meta data
+```{r}
+load(file = "de3_methylumi.RData")
+meta_de3<-read.csv("DE3_Samplesheet.csv",sep=",",header=TRUE) 
+
+## reorder meta sample rows to match methylumi object order
+meta_de3<-meta_de3[order(match(meta_de3$SampleID,sampleNames(de3))),]
+identical(sampleNames(de3.2),as.character(meta_de3$SampleID)) #True
+
+save(meta_de3,file = "meta_de3.RData")
+```
+
+## Pvalues of samples on each array
+** this pvalue refers to detection of the sample on the array, compared to the background ** 
+```{r}
+# calculate average pvalue of 850k probes across each Sample 
+avgPval <- colMeans(pvals(de3.2))
+
+# adding it to the meta data 
+meta_de3$Det_pval<-avgPval
+
+# pvalue plot to to check for outliers
+ggplot(meta_de3)+geom_boxplot(aes(as.factor(Sentrix_ID), Det_pval))+theme_bw()+guides(fill=F)+ theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+## BetaValue distribution
+*using the exterior meta data sample sheet
+```{r}
+# pulling out the beta values to form a matrix
+de3Betas<-betas(de3.2)
+
+# take a subset so the code can run in a reasonable time
+Beta_sample<-de3Betas[sample(1:nrow(de3Betas), 100000),]
+
+# BetaValue distribtuions combined into a format ggplot can understand 
+Beta_sample_melted<- melt(Beta_sample)
+
+# remove NAs before plotting (otherwise get many non-inifnite warnings)
+Beta_Plot<-Beta_sample_melted[which(!(is.na(Beta_sample_melted$value))),]
+
+# add meta
+Beta_Plot<-merge(Beta_Plot,meta_de3,by.x="Var2" ,by.y="SampleID")
+
+# create plot
+ggplot(Beta_Plot, aes(value, group=Var2,color=as.factor(Sentrix_ID)))+ geom_density(size=1)+theme_bw()
+
+```
+
+# Quality Control
+## Confirm ID with SNPs and cluster by tissue type
+```{r}
+# remove rows with NAs
+de3beta_cluster<-de3Betas[complete.cases(de3Betas),]
+
+# take a subset so the code can run in a reasonable time
+small<-de3beta_cluster[sample(1:nrow(de3beta_cluster), 100000),]
+
+# making sure CpG sites and SampleID are matching
+clusterOrder<-as.factor(colnames(de3beta_cluster))
+identical(as.character(sampleNames(de3)),as.character(meta_de3$SampleID),clusterOrder) #True
+identical(meta_de3$SampleID,clusterOrder) #true
+identical(meta_de3$SampleID,as.factor(colnames(small)))#true
+
+# plot clustering with color function
+
+## something I added because the original function doesn't work without this line
+getPalette = colorRampPalette(brewer.pal(9, "Set1")) 
+
+## courtesy of Lisa McEwen 
+clusterColour<- function(betas, color,...){
+dend <- as.dendrogram(hclust(dist(t(as.matrix(betas)))))
+colors_to_use <- color[order.dendrogram(dend)]
+if(nlevels(droplevels(colors_to_use)) >= 2 & nlevels(droplevels(colors_to_use)) <= 9){
+Set1<-  brewer.pal(n=nlevels(droplevels(colors_to_use)),name="Set1")
+colors_to_use <- droplevels(colors_to_use)
+levels(colors_to_use) <- Set1
+labels_colors(dend) <- as.character(colors_to_use)
+} else{
+colPal<-  getPalette(n=nlevels(droplevels(colors_to_use)))
+colors_to_use <- droplevels(colors_to_use)
+levels(colors_to_use) <- colPal
+labels_colors(dend) <- as.character(colors_to_use)       
+}
+plot(dend,...) 
+}
+
+
+#Genotyping Probes (show that samples from the same individual cluster by SNPs)
+CpGs<- rownames(de3Betas)
+SNP_Probes<-CpGs[grep("rs", CpGs)]# 59 SNP probes on EPIC
+SNPs<-de3Betas[CpGs%in%SNP_Probes,]
+# Remove NAs (if any)
+SNPs<-SNPs[complete.cases(SNPs),]# 51 left 
+
+# plot
+clusterColour(betas = small, color = as.factor(meta_de3$SampleType))
+clusterColour(betas= SNPs, color= as.factor(meta_de3$VolunteerNumber))
+
+```
+
+## Probe Filtering
+
+
+1. Removal of SNP Probes
+
+We remove the SNP probes as they are used as an internal control to ensure your samples are what you think they are and are not used for any methylation analysis.
+
+```{r, echo=FALSE}
+de3.2_filtered <- de3.2[substring(featureNames(de3.2),1,2) != "rs", ]
+dim(de3.2_filtered) # probes = 865859, n = 232 #the 59 SNP probes filtered
+```
+
+2. Cross-hybridizing probes and polymorphic probes.
+
+https://genomebiology.biomedcentral.com/articles/10.1186/s13059-016-1066-1
+"43,254 cross-reactive probes with ≥ 47 bp homology with an off-target site, of which 15,782 (36.5 %) are new to the EPIC platform"
+
+They include this annotated list in their supplement.
+
+```{r}
+cross_reactive<-read.csv("Pidsley_cross_reactive.csv", stringsAsFactors = F)
+de3.2_filtered<-de3.2_filtered[which(!(featureNames(de3.2_filtered)%in%cross_reactive$X)),]
+dim(de3.2_filtered) # probes = 822682, n =232, 43177 filtered
+```
+
+3.  For polymorphic probes I will use The Pidsley annotation for "Probes overlapping genetic variants at targeted CpG sites." and "Probes overlapping genetic variants at single base extension sites for Infinium Type I probes" but NOT "Probes with genetic variants overlapping the body of the probe: 48 base pairs for Infinium Type I probes and 49 base pairs for Infinium Type II probes."
+
+```{r}
+polymorphic<-read.csv("Pidsley_Polymorphic_CpGs.csv",stringsAsFactors = F)
+length(unique(polymorphic$PROBE)) #12378
+baseext<-read.csv("Pidsley_single_base_extension.csv",stringsAsFactors = F)
+length(unique(baseext$PROBE)) #413
+
+de3.2_filtered<-de3.2_filtered[which(!(featureNames(de3.2_filtered)%in%c(polymorphic$PROBE, baseext$PROBE))),]
+dim(de3.2_filtered) # probes = 811063, n = 232,  11619 filtered
+```
+
+4. Sex Chromosomes
+
+```{r,eval=FALSE}
+de3.2_filtered <- de3.2_filtered[!featureData(de3.2_filtered)$CHR%in%c("X", "Y"), ]
+
+dim(de3.2_filtered) # probes = 792,939 , n = 232,  18,124 filtered
+save(de3.2_filtered,file = "de3.2_probeFiltered.RData")
+```
+ 
+## Sample mix-up
+** INVESTIGATION **
+```{r}
+# As Rachel suggested, I will cluster by sex to check if the sample match,would only expect one(365-3)
+de3_sex <- de3.2_filtered[fData(de3.2_filtered)$CHR%in%c("X","Y"), ]
+dim(de3_sex) # probes = 18124, n = 232
+
+# we have found 7 outliers, remove them from data
+outliers<-c("347-13","318-7","355-7","355-8","315-6","310-21","315-7")
+filtermeta <- meta_de3[!meta_de3$SampleID %in% outliers,]
+de3_sex<- de3_sex[,!colnames(de3_sex)%in%outliers]
+dim(de3_sex) # probes = 18124, n = 225
+
+# cluster by sex to check for sample mix up
+beta_cluster_sex<-betas(de3_sex)[complete.cases(betas(de3_sex)),]
+identical(as.character(colnames(beta_cluster_sex)),as.character(filtermeta$SampleID)) #True
+clusterColour(betas = beta_cluster_sex, filtermeta$Sex) ## as expected 365-3 is mislabled
+
+### outlier detection for 365-3 
+## indentify whether 365-3 belongs to 368 or not
+## 365 is Male, 368 is Female
+for(i in 1:232) {
+  if(colnames(de3Betas)[i]== "365-3"){
+    a<- de3Betas[which(rownames(de3.2_filtered)=="cg03554089"),i]
+    b<- de3Betas[which(rownames(de3.2_filtered)=="cg12653510"),i]
+    c<- de3Betas[which(rownames(de3.2_filtered)=="cg05533223"),i]
+    if ((a+b+c)/3 >= 0.85){identity="M"} else{indentity="F"} 
+  }
+}  
+# identity of 365-3 is "F",suggesting that 365-3 is mislabeled, the clustering suggests it belongs to 368
+```
+
+We have removed 72,920 probes. This leaves us with 792,939 probes for our analysis. 
+Remove the outliers to perform the next step.
+
+## Filtering the seven significant outliers and redoing clustering
+
+```{r}
+outliers<-c("347-13","318-7","355-7","355-8","315-6","310-21","315-7")
+## filter the outliers from the meta data
+filtermeta <- meta_de3[!meta_de3$SampleID %in% outliers,]
+dim(filtermeta) ## 225 27
+levels(filtermeta)<- 1:nrow(filtermeta)
+save(filtermeta, file = "filtered_metaDE3.RData")
+
+
+de3.2_filtered<- de3.2_filtered[,!sampleNames(de3.2_filtered)%in%outliers]
+dim(de3.2_filtered) # 792939 225
+
+# check if the external meta data order matches the methylumi object order
+identical(as.character(sampleNames(de3.2_filtered)),as.character(filtermeta$SampleID)) #True
+
+# I clustered the samples again to check if anything went wrong, for simplicity sake, I will leave the code out. Everything clusters nicely
+```
+
+
+
+# Watermelon Filter and Normalization
+
+## BMIQ (probe type normalization) For this part, must remove bad data first then run 
+   
+Using pfilter from wateRmelon to filter this
+```{r}
+library(wateRmelon)
+
+
+# "perc"" removes samples having this percentage of sites with a detection p-value greater than pnthresh, default set to 1 (pnthresh=0.05)
+de3.pf<-pfilter(de3.2_filtered, perc=1)
+
+# Console: 
+##  0 samples having 1 % of sites with a detection p-value greater than 0.05 were removed 
+##  Samples removed:  
+##  217 sites were removed as beadcount <3 in 5 % of samples 
+##  1455 sites having 1 % of samples with a detection p-value greater than 0.05 were removed  
+dim(de3.pf) #  791,319      225
+
+# rename and save
+de3.2_filtered<-de3.pf
+save(de3.2_filtered, file = "de3_fully_filtered.RData")
+```
+
+We have removed another 1620 probes. This leaves us with 791,319 probes for our analysis.  
+
+## Probe attrition plot
+```{r}
+df<-data.frame(sample_num_remaining=c(865918,865859,822682,811063,792939,791319),
+               filter=c("EPIC Probe Number",
+                        "Removal of SNP Probes",
+                        "Removal of Pidsley Cross Reactive Probes",
+                        "Removal of Pidsley Polymorphic Probes",
+                        "Removal of Sex-related Probes",
+                        "Removal of Probes with Beadcount <3\nin 5 % of Samples & Removal of Probes with 1 % of samples\nwith a detection p-value greater than 0.05"))
+df$sample_num_lost<-c(0,sapply(2:nrow(df), function(x) df$sample_num_remaining[x-1]-df$sample_num_remaining[x]))
+
+df$filter<-factor(df$filter, rev(df$filter))
+          
+library(scales)
+ggplot(df)+
+  geom_bar(aes(filter,-sample_num_remaining), stat="identity", fill="grey70", color="black")+
+  geom_bar(aes(filter,sample_num_lost), stat="identity",fill="darkred", color="black")+
+  geom_text(aes(x=filter, y=-min(sample_num_remaining)/2,  label=comma(sample_num_remaining)))+
+  geom_text(aes(x=filter, y=max(sample_num_lost)/1.5,  label=comma(sample_num_lost)))+
+  geom_hline(yintercept=0)+
+  coord_flip()+theme_bw()+ylab("")+xlab("")+
+  theme(axis.line = element_blank(),
+        axis.ticks = element_blank(),
+        axis.text.x = element_blank(),
+        axis.text.y = element_text(colour = "grey20", size=12),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) +
+  scale_x_discrete(position = "top") 
+```
+
+
+Normalization (BMIQ)
+```{r,eval=FALSE}
+library(wateRmelon)
+# BMIQ
+de3_bmiq<-BMIQ(de3.2_filtered)
+save(de3_bmiq,file = "de3_bmiq.RData")
+
+# beta distributions
+
+## check external meta data order matches methylumi object order
+identical(as.character(filtermeta$SampleID), as.character(sampleNames(de3_bmiq))) #TRUE
+
+de3_bmiqBetas<-betas(de3_bmiq)
+Beta_sample<-de3_bmiqBetas[sample(1:nrow(de3_bmiqBetas), 100000),]
+
+## format beta file into something R can read
+Beta_sample_melted<- melt(Beta_sample)
+Beta_Plot<-Beta_sample_melted[which(!(is.na(Beta_sample_melted$value))),]
+Beta_Plot<-merge(Beta_Plot,filtermeta, by.x="X2", by.y="SampleID") 
+
+
+## 2018-04-18
+## subset all four tissues and plot by individual
+ggplot(Beta_Plot, aes(value, group=X2,color=SampleType))+ geom_density(size=1)+theme_bw()+facet_wrap(~SampleType)
+
+## NASAL 
+NASAL_Beta_Plot<-Beta_Plot[Beta_Plot$X2%in%NASAL_meta$SampleID,]
+
+ggplot(NASAL_Beta_Plot, aes(value, group=X2,color=VolunteerNumber))+ geom_density(size=1)+theme_bw()+facet_wrap(~VolunteerNumber)
+
+## BAL
+BAL_Beta_Plot<-Beta_Plot[Beta_Plot$X2%in%BAL_meta$SampleID,]
+
+ggplot(BAL_Beta_Plot, aes(value, group=X2,color=VolunteerNumber))+ geom_density(size=1)+theme_bw()+facet_wrap(~VolunteerNumber)
+
+## BRUSH
+BRUSH_Beta_Plot<-Beta_Plot[Beta_Plot$X2%in%BRUSH_meta$SampleID,]
+
+ggplot(BRUSH_Beta_Plot, aes(value, group=X2,color=Exposure))+ geom_density(size=1)+theme_bw()+facet_wrap(~VolunteerNumber)
+
+dim(de3_bmiqBetas) # 791319 225
+save(de3_bmiqBetas, file = "de3_prbFilter_bmiq_norm.RData")
+```
+
+## Check Replications after Normalization 
+```{r}
+load("de3_bmiq.RData")
+
+de3_bmiqBetas<-betas(de3_bmiq)
+
+checkRep1<- de3_bmiqBetas[,grep("rep",colnames(de3_bmiqBetas))]
+cor1 <- cor.test(checkRep1[,"310-17_rep1"], checkRep1[,"310-17_rep2"])  #0.9982217
+cor2 <- cor.test(checkRep1[,"317-18_rep1"], checkRep1[,"317-18_rep2"])  #0.9986897
+cor3 <- cor.test(checkRep1[,"339-8_rep1"], checkRep1[,"339-8_rep2"])    #0.9983028
+cor4 <- cor.test(checkRep1[,"347-23_rep1"], checkRep1[,"347-23_rep2"])  #0.9977875
+cor5 <- cor.test(de3_bmiqBetas[,"365-3"],de3_bmiqBetas[,"368-3"])       #0.9972156
+# check correlation between 365-3(technically 368-3) and 365-1
+cor6 <- cor.test(de3_bmiqBetas[,"365-3"],de3_bmiqBetas[,"365-1"])       #0.9575586 (low)
+# check correlation between 365-3(technically 368-3) and 368-2
+cor7 <- cor.test(de3_bmiqBetas[,"365-3"],de3_bmiqBetas[,"368-2"])       #0.9959253
+# check correlation between 368-2 and 368-3
+cor8 <- cor.test(de3_bmiqBetas[,"368-2"],de3_bmiqBetas[,"368-3"])       #0.9958158
+```
+
+

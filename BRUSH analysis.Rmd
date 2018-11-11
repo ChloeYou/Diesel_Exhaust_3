@@ -1,0 +1,463 @@
+---
+title: "DE3-BRUSH analysis"
+author: "cyou"
+date: "4/27/2018"
+output: html_document
+---
+DE3: BRUSH Analysis
+=================
+##### 2018-08-29 Update: After some investigation in PBMC, I think there can be some improvements made in the model for BRUSH
+#### some functions for later 
+```{r}
+## https://gist.github.com/florianhartig/28e06a0ac1fc6d29af3b
+source_https <- function(url, ...) {
+  # load package
+  require(RCurl)
+ 
+  # parse and evaluate each .R script
+  sapply(c(url, ...), function(u) {
+    eval(parse(text = getURL(u, followlocation = TRUE, cainfo = system.file("CurlSSL", "cacert.pem", package = "RCurl"))), envir = .GlobalEnv)
+  })
+}
+
+## read volcano plot function
+source_https("https://raw.githubusercontent.com/kobor-lab/Co-op_Projects/master/ChloeYou/Volcano%20Plot%20with%20CpG%20Labels.R?token=AhczetoVbIlIRM70O93G-Xea5qFWDx9cks5bPTnJwA%3D%3D")
+```
+
+## filter out the invariable probes in PBMC 
+
+"To designate a CpG as non-variable in a tissue, a threshold of 5% range in beta values (DNAm level ranging from 0 to 1) between the 10th and 90th percentile was used [16]. While effect sizes as small as 1% are used in EWAS [8, 17, 18], we used a slightly more stringent definition of change in beta of 5% as we are asking only that the population as a whole varies by at least 5% and are not testing an effect size between groups. CpGs with less than 5% reference range of beta values in a single tissue population were considered non-variable in that tissue." [1]
+
+Reference: 
+
+[1] Edgar, R. D., Jones, M. J., Robinson, W. P., & Kobor, M. S. (2017). An empirically driven data reduction method on the human 450K methylation array to remove tissue specific non-variable CpGs. Clinical epigenetics, 9(1), 11.
+
+```{r}
+load("adjusted_brush_data.RData")
+brush_adj_betas<-adj.residuals_brush
+
+x <- getURL("https://raw.githubusercontent.com/redgar598/Tissue_Invariable_450K_CpGs/master/Invariant_Blood_CpGs.csv")
+y <- read.csv(text = x) #114204 
+## file y has CpG and RefRange
+
+## finding the DE3 probes that are also in the reference list(overlap) 
+DE3_independent_blood_invariable<-betas(de3_bmiq_PBMC)[which(rownames(betas(de3_bmiq_PBMC))%in%y$CpG),]#102297 of the independnt invariable sites are in DE3 PBMC
+
+
+## Call varibility in DE3
+Variation<-function(x) {quantile(x, c(0.9), na.rm=T)[[1]]-quantile(x, c(0.1), na.rm=T)[[1]]}
+DE3_ref_range<-sapply(1:nrow(DE3_independent_blood_invariable), function(x) Variation(DE3_independent_blood_invariable[x,]))
+
+## taking out the probes that vary very little(less than 0.05) 
+Invariable_in_DE3<-DE3_independent_blood_invariable[which(DE3_ref_range<0.05),]
+
+# Which CpGs are invariable in DE3 and the independent data
+invar_in_de3_and_independent<-intersect(y$CpG, rownames(Invariable_in_DE3)) #101821/102297 (99.5%)
+DE3_betas_variable<-betas(de3_bmiq_PBMC)[which(!(rownames(betas(de3_bmiq_PBMC))%in%invar_in_de3_and_independent)),]#689498
+de3_PBMC_betas<-DE3_betas_variable #689498 that varies 
+save(de3_PBMC_betas,file = "de3_PBMC_filtered_invariable_probes.RData")
+```
+
+## create M-value file for brush
+```{r,eval=FALSE}
+setwd("DE3")
+load("DE3meta.RData")
+load("adjusted_brush_data.RData")
+# BRUSH
+## take brush meta data from filtermeta 
+meta_BRUSH<-filtermeta[filtermeta$SampleType=="BRUSH",]
+save(meta_BRUSH,file="BRUSH_meta.RData")
+## use adjusted betas for brush
+mval_BRUSH<-Mval(brush_adj_betas)
+dim(mval_BRUSH) # 791319     50
+save(mval_BRUSH,file="mval_BRUSH.RData")
+
+## set filtered air-salin as control group
+meta_BRUSH$Exposure<-relevel(meta_BRUSH$Exposure,ref = "FA-S")
+```
+
+## split the Mvalue data into three groups, each comparing to the baseline FA-S
+```{r}
+load("mval_BRUSH.RData")
+load("BRUSH_meta.RData")
+## extract FA-S, DE-A Mval for linear model
+fasdea_sampleID<-meta_BRUSH$SampleID[which(meta_BRUSH$Exposure%in%c("FA-S","DE-A"))]
+FASDEA<-mval_BRUSH[,colnames(mval_BRUSH)%in%fasdea_sampleID]
+rm(fasdea_sampleID)
+## extract FA-S, FA-A Mval for linear model
+fasfaa_sampleID<-meta_BRUSH$SampleID[which(meta_BRUSH$Exposure%in%c("FA-S","FA-A"))]
+FASFAA<-mval_BRUSH[,colnames(mval_BRUSH)%in%fasfaa_sampleID]
+rm(fasfaa_sampleID)
+## extract FA-S, PDDE-A Mval for linear model
+faspddea_sampleID<-meta_BRUSH$SampleID[which(meta_BRUSH$Exposure%in%c("FA-S","PDDE-A"))]
+FASPDDEA<-mval_BRUSH[,colnames(mval_BRUSH)%in%faspddea_sampleID]
+rm(faspddea_sampleID)
+
+## checking the data out
+dim(FASDEA) # 791319 26  perfectly balanced 
+dim(FASFAA) # 791319 24  will remove singled out sample, leaving 11 pairs to analyze
+dim(FASPDDEA) # 791319 26 perfectly balanced 
+save(FASFAA,FASDEA,FASPDDEA,file = "brush_three_groups_split.RData")
+
+```
+
+side note for running mixed effect models: "ML estimates are unbiased for the fixed effects but biased for the random effects, whereas the REML estimates are biased for the fixed effects and unbiased for the random effects."
+
+## 1. FA-S, DE-A group
+```{r,eval=FALSE}
+load("CpG_sites_in_order_brush.RData")
+load("brush_three_groups_split.RData")
+load("BRUSH_meta.RData")
+
+
+FASDEA_meta<-meta_BRUSH[which(meta_BRUSH$Exposure%in%c("FA-S","DE-A")),]
+identical(as.character(FASDEA_meta$SampleID),as.character(colnames(FASDEA))) ## true 
+
+FASDEA_lm<-pbsapply(1:nrow(FASDEA),function(CpG) {
+  metaex<-FASDEA_meta
+  metaex$Mval<-FASDEA[CpG,]
+  mod_brush<-lmer(Mval ~ Exposure+(1|VolunteerNumber),data=metaex)
+  mod_brush_2<-lmer(Mval ~ (1|VolunteerNumber),data=metaex)
+  anova(mod_brush,mod_brush_2)[2,8]
+    }
+  )
+
+rm(FASDEA_meta)
+
+## adding rownames and saving file
+FASDEA_lm<-as.data.frame(FASDEA_lm)
+rownames(FASDEA_lm)<-CpGsites$CpGsites
+FASDEA_lm$CpG<-CpGsites$CpGsites
+save(FASDEA_lm,file="FASDEA_lm.RData")
+
+## threshold , find hits
+hits_FASDEA<-FASDEA_lm[which(FASDEA_lm$FASDEA_lm<=0.0000001),] #  CpG  10^-7
+hits_FASDEA_2<-FASDEA_lm[which(FASDEA_lm$FASDEA_lm<=0.000001),] #  CpG 10^-6
+hits_FASDEA_3<-FASDEA_lm[which(FASDEA_lm$FASDEA_lm<=0.00001),] #  CpG 10^-5
+hits_FASDEA_3<-FASDEA_lm[which(FASDEA_lm$FASDEA_lm<=0.00001),] #  23 CpG 10^-5
+hits_FASDEA_4<-FASDEA_lm[which(FASDEA_lm$FASDEA_lm<=0.0001),] #  CpG 10^-4
+#hits<- colnames(df)[1:11]
+save(hits_FASDEA_3,file="hits_FASDEA.RData")
+
+## creating effect size for FASDEA (DEA-FAS)-> volcano plot
+## effect sizes are beta values
+
+FASDEA_beta<-brush_adj_betas[,colnames(brush_adj_betas)%in%FASDEA_meta$SampleID]
+dim(FASDEA_beta) #791319     26
+
+## creating a paired dataset to minus the values within pairs omg how do i do this
+identical(as.character(colnames(FASDEA_beta)),as.character(FASDEA_meta$SampleID)) # TRUE 
+
+## create two matrix, one for each exposure 
+## matrix for DE-A, rownames are SampleID/VolunteerNumber, colnames are CpG sites
+FAS_meta<-FASDEA_meta[FASDEA_meta$Exposure=="FA-S",]
+DEA_meta<-FASDEA_meta[FASDEA_meta$Exposure=="DE-A",]
+
+DEA_matrix<-FASDEA_beta[,colnames(FASDEA_beta)%in%DEA_meta$SampleID]
+FAS_matrix<-FASDEA_beta[,colnames(FASDEA_beta)%in%FAS_meta$SampleID]
+
+colnames(DEA_matrix)<-substr(colnames(DEA_matrix),1,3)
+colnames(FAS_matrix)<-substr(colnames(FAS_matrix),1,3)
+
+## order samples to match individual
+FAS_matrix<-FAS_matrix[,colnames(DEA_matrix)]
+
+## delta beta is made here
+delbeta_matrix<-DEA_matrix-FAS_matrix
+
+FASDEA_delbet<-rowMeans(delbeta_matrix)
+FASDEA_delbet<-as.data.frame(FASDEA_delbet)
+
+## make volcano plot and save files
+FASDEA_lm<-as.data.frame(FASDEA_lm)
+makeVolcano(FASDEA_lm$FASDEA_lm,FASDEA_delbet$FASDEA_delbet,CpGsites$CpGsites,0.05,0.00001,"FASDEA_volcanoplot")
+save(FASDEA_lm,delbeta_matrix,FASDEA_delbet,file="FASDEA_effect_size_all_files.RData")
+
+## pull out the hits from volcano plot
+FASDEA_delbet$CpG<-rownames(FASDEA_delbet)
+ FASDEA_delbet_hits<-FASDEA_delbet[rownames(FASDEA_delbet)%in%rownames(hits_FASDEA_3),]
+ FASDEA_delbet_hits<-as.data.frame(FASDEA_delbet_hits)
+ FASDEA_delbet_hits<-FASDEA_delbet_hits[order(match(rownames(hits_FASDEA_3),FASDEA_delbet_hits$CpG)),]
+ identical(FASDEA_delbet_hits$CpG,rownames(hits_FASDEA_3)) 
+FASDEA_hits<-FASDEA_delbet_hits[abs(FASDEA_delbet_hits$FASDEA_delbet)>0.05,] ## this is the object 
+rm(FASDEA_delbet_hits)
+```
+
+## 2. FA-S, PDDE-A group
+```{r,eval=FALSE}
+load("CpG_sites_in_order_brush.RData")
+load("brush_three_groups_split.RData")
+load("BRUSH_meta.RData")
+
+
+FASPDDEA_meta<-meta_BRUSH[which(meta_BRUSH$Exposure%in%c("FA-S","PDDE-A")),]
+identical(as.character(FASPDDEA_meta$SampleID),as.character(colnames(FASPDDEA))) ## true 
+
+FASPDDEA_lm<-sapply(1:nrow(FASPDDEA),function(CpG) {
+  metaex<-FASPDDEA_meta
+  metaex$Mval<-FASPDDEA[CpG,]
+  mod_brush<-lmer(Mval ~ Exposure+(1|VolunteerNumber),data=metaex)
+  mod_brush_2<-lmer(Mval ~ (1|VolunteerNumber),data=metaex)
+  anova(mod_brush,mod_brush_2)[2,8]
+    }
+  )
+
+rm(FASPDDEA_meta)
+
+## adding rownames and saving file
+FASPDDEA_lm<-as.data.frame(FASPDDEA_lm)
+rownames(FASPDDEA_lm)<-CpGsites$CpGsites
+FASPDDEA_lm$CpG<-CpGsites$CpGsites
+save(FASPDDEA_lm,file="FASPDDEA_lm.RData")
+
+## threshold , find hits
+hits_FASPDDEA<-FASPDDEA_lm[which(FASPDDEA_lm$FASPDDEA_lm<=0.0000001),] #   CpG  10^-7
+hits_FASPDDEA_2<-FASPDDEA_lm[which(FASPDDEA_lm$FASPDDEA_lm<=0.000001),] #  CpG 10^-6
+hits_FASPDDEA_3<-FASPDDEA_lm[which(FASPDDEA_lm$FASPDDEA_lm<=0.00001),] # 17  CpG 10^-5
+hits_FASPDDEA_4<-FASPDDEA_lm[which(FASPDDEA_lm$FASPDDEA_lm<=0.0001),] #  CpG 10^-4
+save(hits_FASPDDEA_3,file="hits_FASPDDEA.RData")
+
+
+## creating effect size for FASPDDEA (PDDEA-FAS)-> volcano plot
+## effect sizes are beta values
+FASPDDEA_beta<-brush_adj_betas[,colnames(brush_adj_betas)%in%FASPDDEA_meta$SampleID]
+dim(FASPDDEA_beta) #791319     26
+
+## creating a paired dataset to minus the values within pairs 
+identical(as.character(colnames(FASPDDEA_beta)),as.character(FASPDDEA_meta$SampleID)) # TRUE
+
+## create two matrix, one for each exposure 
+## matrix for DE-A, rownames are SampleID/VolunteerNumber, colnames are CpG sites
+FAS_meta<-FASPDDEA_meta[FASPDDEA_meta$Exposure=="FA-S",]
+PDDEA_meta<-FASPDDEA_meta[FASPDDEA_meta$Exposure=="PDDE-A",]
+
+PDDEA_matrix<-FASPDDEA_beta[,colnames(FASPDDEA_beta)%in%PDDEA_meta$SampleID]
+FAS_matrix<-FASPDDEA_beta[,colnames(FASPDDEA_beta)%in%FAS_meta$SampleID]
+
+colnames(PDDEA_matrix)<-substr(colnames(PDDEA_matrix),1,3)
+colnames(FAS_matrix)<-substr(colnames(FAS_matrix),1,3)
+
+## order samples to match individual
+FAS_matrix<-FAS_matrix[,colnames(PDDEA_matrix)]
+
+## delta beta is made here
+delbeta_matrix_FASPDDEA<-PDDEA_matrix-FAS_matrix
+
+FASPDDEA_delbet<-rowMeans(delbeta_matrix_FASPDDEA)
+FASPDDEA_delbet<-as.data.frame(FASPDDEA_delbet)
+
+## make volcano plot and save files
+FASPDDEA_lm<-as.data.frame(FASPDDEA_lm)
+makeVolcano(FASPDDEA_lm$FASPDDEA_lm,FASPDDEA_delbet$FASPDDEA_delbet,CpGsites$CpGsites,0.05,0.00001,"FASPDDEA_volcanoplot")
+save(FASPDDEA_lm,delbeta_matrix_FASPDDEA,FASPDDEA_delbet,file="FASPDDEA_effect_size_all_files.RData")
+
+## pull out the hits in the volcano plot
+FASPDDEA_delbet$CpG<-rownames(FASPDDEA_delbet)
+ FASPDDEA_delbet_hits<-FASPDDEA_delbet[rownames(FASPDDEA_delbet)%in%rownames(hits_FASPDDEA_3),]
+ FASPDDEA_delbet_hits<-as.data.frame(FASPDDEA_delbet_hits)
+ FASPDDEA_delbet_hits<-FASPDDEA_delbet_hits[order(match(rownames(hits_FASPDDEA_3),FASPDDEA_delbet_hits$CpG)),]
+ identical(FASPDDEA_delbet_hits$CpG,rownames(hits_FASPDDEA_3)) 
+FASPDDEA_hits<-FASPDDEA_delbet_hits[abs(FASPDDEA_delbet_hits$FASPDDEA_delbet)>0.05,] ## this is the object 
+rm(FASPDDEA_delbet_hits)
+```
+
+## 3. FA-S, FA-A group
+this group has only 11 pairs, need to remove 334 and 368 from meta data and beta file
+```{r,eval=FALSE}
+load("CpG_sites_in_order_brush.RData")
+load("brush_three_groups_split.RData")
+load("BRUSH_meta.RData")
+
+## remove 334 and 368 from meta data
+FASFAA_meta<-meta_BRUSH[which(meta_BRUSH$Exposure%in%c("FA-S","FA-A")),]
+FASFAA_meta<-FASFAA_meta[!FASFAA_meta$VolunteerNumber%in%c("334","368"),] ## 22
+## remove 334 and 368 from Mval file
+FASFAA<-FASFAA[,!colnames(FASFAA)%in%c("334-3","368-4")]
+dim(FASFAA) #791319     22
+
+identical(as.character(FASFAA_meta$SampleID),as.character(colnames(FASFAA))) ## true 
+
+FASFAA_lm<-pbsapply(1:nrow(FASFAA),function(CpG) {
+  metaex<-FASFAA_meta
+  metaex$Mval<-FASFAA[CpG,]
+  mod_brush<-lmer(Mval ~ Exposure+(1|VolunteerNumber),data=metaex)
+  mod_brush_2<-lmer(Mval ~ (1|VolunteerNumber),data=metaex)
+  anova(mod_brush,mod_brush_2)[2,8]
+    }
+  )
+
+rm(FASFAA_meta)
+
+## adding the list of CpG names into the pval file
+FASFAA_lm<-as.data.frame(FASFAA_lm)
+rownames(FASFAA_lm)<-CpGsites$CpGsites
+FASFAA_lm$CpG<-CpGsites$CpGsites
+save(FASFAA_lm,file="FASFAA_lm.RData")
+
+## threshold , find hits
+hits_FASFAA<-FASFAA_lm[which(FASFAA_lm$FASFAA_lm<=0.0000001),] #   CpG  10^-7
+hits_FASFAA_2<-FASFAA_lm[which(FASFAA_lm$FASFAA_lm<=0.000001),] # 3 CpG 10^-6
+hits_FASFAA_3<-FASFAA_lm[which(FASFAA_lm$FASFAA_lm<=0.00001),] #  31 CpG 10^-5
+hits_FASFAA_4<-FASFAA_lm[which(FASFAA_lm$FASFAA_lm<=0.0001),] # 
+
+save(hits_FASFAA_3,file="hits_FASFAA.RData")
+
+## creating effect size for FASFAA (FAA-FAS)-> volcano plot
+## effect sizes are beta values
+FASFAA_beta<-brush_adj_betas[,colnames(brush_adj_betas)%in%FASFAA_meta$SampleID]
+dim(FASFAA_beta) #791319     22
+
+## creating a paired dataset to minus the values within pairs
+identical(as.character(colnames(FASFAA_beta)),as.character(FASFAA_meta$SampleID)) # TRUE
+
+## create two matrix, one for each exposure 
+## matrix for DE-A, rownames are SampleID/VolunteerNumber, colnames are CpG sites
+FAS_meta<-FASFAA_meta[FASFAA_meta$Exposure=="FA-S",]
+FAA_meta<-FASFAA_meta[FASFAA_meta$Exposure=="FA-A",]
+
+FAA_matrix<-FASFAA_beta[,colnames(FASFAA_beta)%in%FAA_meta$SampleID]
+FAS_matrix<-FASFAA_beta[,colnames(FASFAA_beta)%in%FAS_meta$SampleID]
+
+colnames(FAA_matrix)<-substr(colnames(FAA_matrix),1,3)
+colnames(FAS_matrix)<-substr(colnames(FAS_matrix),1,3)
+
+## order samples to match individual 
+FAS_matrix<-FAS_matrix[,colnames(FAA_matrix)]
+
+## delta beta is made here
+delbeta_matrix_FASFAA<-FAA_matrix-FAS_matrix
+
+FASFAA_delbet<-rowMeans(delbeta_matrix_FASFAA)
+FASFAA_delbet<-as.data.frame(FASFAA_delbet)
+
+## make volcano plot and save files
+FASFAA_lm<-as.data.frame(FASFAA_lm)
+makeVolcano(FASFAA_lm$FASFAA_lm,FASFAA_delbet$FASFAA_delbet,CpGsites$CpGsites,0.05,0.00001,"FASFAA_volcanoplot")
+save(FASFAA_lm,delbeta_matrix_FASFAA,FASFAA_delbet,file="FASFAA_effect_size_all_files.RData")
+
+## pull out the hits in the volcano plot
+FASFAA_delbet$CpG<-rownames(FASFAA_delbet)
+ FASFAA_delbet_hits<-FASFAA_delbet[rownames(FASFAA_delbet)%in%rownames(hits_FASFAA_3),]
+ FASFAA_delbet_hits<-as.data.frame(FASFAA_delbet_hits)
+ FASFAA_delbet_hits<-FASFAA_delbet_hits[order(match(rownames(hits_FASFAA_3),FASFAA_delbet_hits$CpG)),]
+ identical(FASFAA_delbet_hits$CpG,rownames(hits_FASFAA_3)) 
+FASFAA_hits<-FASFAA_delbet_hits[abs(FASFAA_delbet_hits$FASFAA_delbet)>0.05,] ## this is the object 
+rm(FASFAA_delbet_hits)
+
+```
+
+## merge all hits into one data set 
+```{r}
+# merge the three hit data frames, leaving three columns:CpG,Group,Pval
+## rename Pval column
+colnames(FASDEA_hits)[colnames(FASDEA_hits)=="FASDEA_delbet"] <- "effect size"
+colnames(FASFAA_hits)[colnames(FASFAA_hits)=="FASFAA_delbet"] <- "effect size"
+colnames(FASPDDEA_hits)[colnames(FASPDDEA_hits)=="FASPDDEA_delbet"] <- "effect size"
+## add Group Column 
+FASDEA_hits$Group<-"FASDEA"
+FASFAA_hits$Group<-"FASFAA"
+FASPDDEA_hits$Group<-"FASPDDEA"
+
+## combine data sets
+hits_brush_vol<-rbind(FASFAA_hits,FASDEA_hits,FASPDDEA_hits)
+save(FASDEA_hits,FASFAA_hits,FASPDDEA_hits,hits_brush_vol,file="volcano_hits_brush.RData")
+
+
+# merge the three hit data frames, leaving three columns:CpG,Group,Pval
+## rename Pval column
+colnames(hits_FASDEA_3)[colnames(hits_FASDEA_3)=="FASDEA_lm"] <- "Pval"
+colnames(hits_FASFAA_3)[colnames(hits_FASFAA_3)=="FASFAA_lm"] <- "Pval"
+colnames(hits_FASPDDEA_3)[colnames(hits_FASPDDEA_3)=="FASPDDEA_lm"] <- "Pval"
+## add Group Column 
+hits_FASDEA_3$Group<-"FASDEA"
+hits_FASFAA_3$Group<-"FASFAA"
+hits_FASPDDEA_3$Group<-"FASPDDEA"
+
+## combine data sets
+hits_brush<-rbind(hits_FASDEA_3,hits_FASFAA_3,hits_FASPDDEA_3)
+
+## save files 
+save(hits_FASDEA_3,hits_FASFAA_3,hits_FASPDDEA_3,hits_brush,file="all_hits_brush.RData")
+```
+
+## create plots to analyze the hits found in each group
+### 1. boxplot
+for each hit, create a boxplot with x-axis being the two seperate exposures and y-axis being the beta values
+```{r}
+# use "hits_brush" file
+
+## comment out the code below, found it online 
+## ggplot(mtcars,aes(factor(cyl),mpg))+geom_boxplot()+
+##   geom_point(aes(color=factor(am)),position=position_dodge(width=0.5))
+
+## I guess i need to create a new file with the beta value of one CpG site from all 26/24 samples, 13 in each side of the boxplot
+
+## create new file for CpG site boxplot
+## extract rows(CpG) from the brush_adj_beta
+compiled_hits<-brush_adj_betas[rownames(brush_adj_betas)%in%hits_brush$CpG,]
+dim(compiled_hits) # 71 50
+
+## makes rows into SampleID and columns into CpG
+compiled_hits<-as.data.frame(t(compiled_hits))
+## check out compiled_hits
+
+## add another column of Exposure group
+identical(as.character(rownames(compiled_hits)),as.character(colnames(brush_adj_betas))) #true
+
+## create ggplots 
+## for each hit, we will plot all samples, including the exposures that weren't associated with finding this hit 
+
+compiled_hits<-brush_adj_betas[rownames(brush_adj_betas)%in%hits_brush_vol$CpG,]
+dim(compiled_hits) # 71 50
+compiled_hits<-as.data.frame(t(compiled_hits))
+identical(as.character(rownames(compiled_hits)),as.character(colnames(brush_adj_betas))) #true
+## add another column to "compiled_hits" indicating the exposure of the sample 
+identical(as.character(rownames(compiled_hits)),as.character(meta_BRUSH$SampleID)) #true
+compiled_hits$Exposure<-meta_BRUSH$Exposure
+compiled_hits$VolunteerNumber<-substr(rownames(compiled_hits),1,3)
+
+## general boxplot
+my_comparisons <- list( c("FA-S", "DE-A"), c("FA-S", "FA-A"), c("FA-S", "PDDE-A"))
+plots <- lapply(1:7, function(i) ggplot(compiled_hits,aes(as.factor(compiled_hits$Exposure),compiled_hits[,i],color=as.factor(compiled_hits$Exposure)))+geom_boxplot()+geom_point(shape=19,size=1, position=position_jitter(w=0.25),color="grey")+theme_bw()+xlab("Exposure")+ylab("Beta Value")+labs(title=colnames(compiled_hits)[i])+ stat_compare_means(comparisons = my_comparisons,method = "wilcox.test"))
+
+do.call(grid.arrange, plots) 
+```
+
+### 2. spaghetti plot for the three paired groups 
+```{r}
+## use "compiled_hits"
+## creating 7*3-2(missing data) plots
+
+seven<-list()
+for(i in 1:7){
+ newdf<-compiled_hits[,c(i,8,9)]
+ FAA<-newdf[newdf$Exposure%in%c("FA-S","FA-A"),] # 24
+ FAA<-FAA[!FAA$VolunteerNumber%in%c("368","341"),]
+ DEA<-newdf[newdf$Exposure%in%c("FA-S","DE-A"),] # 26
+ PDDEA<-newdf[newdf$Exposure%in%c("FA-S","PDDE-A"),] # 26
+ 
+ FAA$Exposure<- factor(FAA$Exposure, levels=c("FA-S","FA-A"))
+ DEA$Exposure<- factor(DEA$Exposure, levels=c("FA-S","DE-A"))
+ PDDEA$Exposure<- factor(PDDEA$Exposure, levels=c("FA-S","PDDE-A"))
+ 
+  p1<-ggplot(FAA,aes(as.factor(FAA$Exposure),FAA[,1],color=as.factor(FAA$VolunteerNumber),group=FAA$VolunteerNumber))+geom_line()+geom_point(shape=19,size=1,color="grey")+theme_minimal()+xlab("Exposure")+ylab("Beta Value")+labs(title=colnames(FAA)[1])+theme(legend.position='none')
+ 
+  p2<-ggplot(DEA,aes(as.factor(DEA$Exposure),DEA[,1],color=as.factor(DEA$VolunteerNumber),group=DEA$VolunteerNumber))+geom_line()+geom_point(shape=19,size=1,color="grey")+theme_minimal()+theme(legend.position='none')+labs(x="", y="")
+  
+  p3<-ggplot(PDDEA,aes(as.factor(PDDEA$Exposure),PDDEA[,1],color=as.factor(PDDEA$VolunteerNumber),group=PDDEA$VolunteerNumber))+geom_line()+geom_point(shape=19,size=1,color="grey")+theme_minimal()+theme(legend.position='none')+labs(x="", y="")
+   
+  seven[[i]]<-grid.arrange(p1,p2,p3,ncol=3)
+}
+
+do.call("grid.arrange", c(seven, ncol=2))
+
+```
+
+#### check UCSC genes on the 7 hits found in the volcano plots
+```{r}
+fd<-fData(de3_bmiq_BRUSH)
+fd<-fd[rownames(fd)%in%hits_brush_vol$CpG,]  # 7
+colnames(fd) #"UCSC_REFGENE_NAME" idk what other columns i need to pay attention to
+UCSC_gene<-as.data.frame(fd$UCSC_REFGENE_NAME)
+```
+#### limitations: deconvolution method; the model can be better; lots of invariable probes;...

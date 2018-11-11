@@ -1,0 +1,886 @@
+---
+title: "DE3-Cell_Deconvolution"
+author: "cyou"
+date: "3/6/2018"
+output: html_document
+---
+DE3 Analysis: ComBat & Cell Deconvolution
+==========================================
+ComBat is used to remove technical variation in microarray data. [1]
+
+Cell Deconvolution:  "Genome-scale measures of DNAm in samples derived from heterogeneous mixtures of cells, such as peripheral blood, include signals from all cells present. Therefore, variation in cell-type proportions across samples has the potential to confound associations of DNAm with modeled outcomes."[2]
+
+
+Reference:
+1. Johnson, W. Evan, Cheng Li, and Ariel Rabinovic. "Adjusting batch effects in microarray expression data using empirical Bayes methods." Biostatistics 8.1 (2007): 118-127.
+2. Titus, Alexander J., et al. "Cell-type deconvolution from DNA methylation: a review of recent applications." Human molecular genetics 26.R2 (2017): R216-R224.
+
+========================
+
+```{r setup, include=FALSE}
+library(methylumi)
+library(wateRmelon)
+library(RPMM)
+library("ggsci")
+library(dendextend)
+library(RColorBrewer)
+library(ggplot2)
+library(dplyr)
+library("sva")
+library(parallel)
+#library(gridExtra)
+library(grid)
+library("reshape2")
+library(limma)
+library(FlowSorted.Blood.450k)
+library(minfi)
+library(IlluminaHumanMethylation450kmanifest)
+library(quadprog)
+
+setwd("~/DE3")
+```
+
+# some functions that will be used for later
+*courtesy of Rachel Edgar
+```{r}
+# imputes median across a row
+imputeMedianv3<-function(x) apply(x, 1, function(x){x[is.na(x)]<-median(x, na.rm=T); x})
+
+# by definition, turn M-values into Beta-values
+turnbetas<-function(M) 2^M/((2^M)+1)
+
+```
+# Impute all beta value together and perform ComBat 
+```{r}
+load("~/DE3/de3_bmiq.RData")
+load("~/DE3/DE3meta.RData")
+
+# impute with row mean
+All_betas_imputed<-t(imputeMedianv3(betas(de3_bmiq)))
+dim(All_betas_imputed) # 791319 225
+
+# sanity check that there are no NAs left
+stopifnot(!is.na(All_betas_imputed))
+
+# load imputed file into methylumi object
+betas(de3_bmiq)<-All_betas_imputed
+
+# save file
+save(de3_bmiq,file = "de3_bmiq_Imputed.RData")
+
+# PCA before ComBat to observe technical variation
+PCA_all <- princomp(betas(de3_bmiq)) 
+Loadings<- as.data.frame(unclass(PCA_all$loadings)) 
+vars <- PCA_all$sdev^2
+Importance <- vars/sum(vars)
+
+colnames(filtermeta)
+filtermeta$Sentrix_ID<-as.factor(filtermeta$Sentrix_ID)
+filtermeta$Sentrix_Position<-as.factor(filtermeta$Sentrix_Position)
+filtermeta$Sample_Plate<-as.factor(filtermeta$Sample_Plate)
+filtermeta$Ethnicity<-as.factor(filtermeta$Ethnicity)
+filtermeta$Batch<-as.factor(filtermeta$Batch)
+filtermeta$AllergyTo<-as.factor(filtermeta$AllergyTo)
+filtermeta$VolunteerNumber<-as.factor(filtermeta$VolunteerNumber)
+filtermeta$SampleType<-as.factor(filtermeta$SampleType)
+
+meta_categorical <- filtermeta[, c(21,24,25,26,18,13,4,11)] 
+colnames(meta_categorical)<- c("Sample_Plate","Sentrix_ID","Sentrix_Position","Batch","Ethnicity","Allergen","VolunteerNumber","TissueType")
+
+heat_scree_plot(Loadings, Importance)
+
+
+# Combat on Sentrix ID 
+## notice: exprs(de3_bmiq) are M-values, so "All_ComBat"" are M-values
+All_Combat<- ComBat(exprs(de3_bmiq), as.character(filtermeta$Sentrix_ID)) 
+
+# Back to betas
+all_Combat_Beta = apply(All_Combat, 1, turnbetas) 
+all_Combat_Beta = as.data.frame(all_Combat_Beta)
+all_Combat_Beta = t(all_Combat_Beta)
+
+# load ComBated file into methylumi object
+betas(de3_bmiq)<-all_Combat_Beta
+
+# save
+save(de3_bmiq,file = "de3_bmiq_ComBatSenID.RData")
+    
+# another heat scree to check if batch effect is removed
+PCA_all<-princomp(betas(de3_bmiq))
+Loadings<-as.data.frame(unclass(PCA_all$loadings))
+vars <- PCA_all$sdev^2
+Importance<-vars/sum(vars)
+heat_scree_plot(Loadings, Importance)
+```
+Seperate by Tissue Type and perform Houseman on PBMC and BAL 
+Reference: 
+Houseman et al.: DNA methylation arrays as surrogate measures of cell mixture distribution. BMC Bioinformatics 2012 13:86.
+
+# Cell Deconvolution
+## Houseman on PBMC
+```{r}
+## pull out PBMC meta data
+PBMC_meta<-filtermeta[filtermeta$SampleType=="PBMC",]
+levels(PBMC_meta)<- 1:nrow(PBMC_meta)
+rownames(PBMC_meta)<-1:nrow(PBMC_meta)
+
+## pull out PBMC
+de3_bmiq_PBMC<-de3_bmiq[,as.factor(sampleNames(de3_bmiq))%in%PBMC_meta$SampleID]
+dim(de3_bmiq_PBMC) # 791319 108
+save(de3_bmiq_PBMC,file = "de3_bmiq_PBMC.RData")
+
+## another heat scree on PBMC
+PBMC_full<-princomp(betas(de3_bmiq_PBMC))
+Loadings<-as.data.frame(unclass(PBMC_full$loadings))
+vars <- PBMC_full$sdev^2
+Importance<-vars/sum(vars)
+heat_scree_plot(Loadings, Importance)
+
+PBMCset = as.data.frame(betas(de3_bmiq_PBMC))
+source("/home/cyou/DE3/ECC7.R")
+predictions<- ECC7(PBMCset)
+counts<- predictions$counts
+save(counts,file="de3_PBMC_cell counts_ECC7.RData")
+
+## Rachel's code from "450k-Analysis/analysis scripts/drift_project/GEO/GSE61151_processing.R"
+betas<-as.data.frame(betas(de3_bmiq_PBMC))
+diff <- as.data.frame(counts)
+
+diff$sampleID<-rownames(diff)
+diff_melt<- melt(diff)
+
+ggplot(diff_melt, aes(variable, value, color=as.factor(variable)))+
+#+facet_wrap(~Data)
+  geom_point(shape=19, position = position_jitter(w = 0.2))+theme_bw()+xlab("Cell Type")+ylab("Cell Type Proportion")+
+  scale_color_manual(values=c("#a50026", "#bd0026", "#e31a1c", "#fc4e2a", "#fd8d3c", "#feb24c"),guide=FALSE)
+
+# fit linear model for cell type effects on each probe in betas
+
+#PCA on the cell counts, then use PCs to correct the data.
+PBMC.pcs<- prcomp(counts, center=T, scale=T)
+# Meg's original code
+betas.lm<-apply(betas, 1, function(x){
+  as.data.frame(PBMC.pcs[[5]][colnames(betas),]) -> blood
+  lm(x~PC1+PC2+PC3+PC4+PC5+PC6, data=blood)
+})
+
+
+# extract matrix of residuals from resulting linear models
+residuals <- t(sapply(betas.lm, function(x)residuals(summary(x))))
+
+
+# add the residuals of each regression model to the mean methylation value of each probe (mean across all samples) to obtain the “adjusted” methylation data.
+adj.residuals <- residuals+matrix(apply(betas, 1, function(x) mean(as.numeric(x), na.rm=T)), nrow = nrow(residuals), ncol = ncol(residuals))
+
+de3_PBMC_beta<-adj.residuals
+
+## counts again after correction
+de3_PBMC_beta<-as.data.frame(de3_PBMC_beta)
+predictions<- ECC7(de3_PBMC_beta)
+counts_corrected<- predictions$counts
+save(counts_corrected, file="de3_PBMC_cell_counts_adjusted.RData")
+
+# Plot cell counts before and after
+cellprop_melt<-melt(counts, id="sampleID")
+cellprop_melt$Data<-"unadjusted"
+
+cellprop_melt_adjusted<-melt(counts_corrected, id="sampleID")
+cellprop_melt_adjusted$Data<-"adjusted"
+
+cellprop_melt_blood<-rbind(cellprop_melt, cellprop_melt_adjusted)
+
+cellprop_melt_blood$Data <- as.factor(cellprop_melt_blood$Data)
+cellprop_melt_blood$Data <- factor(cellprop_melt_blood$Data,c("unadjusted", "adjusted"))
+
+ggplot(cellprop_melt_blood, aes(Var2, value, color=as.factor(Var2)))+facet_wrap(~Data)+
+  geom_point(shape=19, position = position_jitter(w = 0.2))+theme_bw()+xlab("Sample")+ylab("Cell Type Proportion")+
+  scale_color_manual(values=c("#a50026", "#bd0026", "#e31a1c", "#fc4e2a", "#fd8d3c", "#feb24c"),guide=FALSE)
+
+## another heat scree
+PBMC_full<-princomp(de3_PBMC_beta)
+Loadings<-as.data.frame(unclass(PBMC_full$loadings))
+vars <- PBMC_full$sdev^2
+Importance<-vars/sum(vars)
+
+colnames(PBMC_meta)
+PBMC_meta$Sentrix_ID<-as.factor(PBMC_meta$Sentrix_ID)
+PBMC_meta$Sentrix_Position<-as.factor(PBMC_meta$Sentrix_Position)
+PBMC_meta$Sample_Plate<-as.factor(PBMC_meta$Sample_Plate)
+PBMC_meta$Ethnicity<-as.factor(PBMC_meta$Ethnicity)
+PBMC_meta$Batch<-as.factor(PBMC_meta$Batch)
+PBMC_meta$AllergyTo<-as.factor(PBMC_meta$AllergyTo)
+PBMC_meta$VolunteerNumber<-as.factor(PBMC_meta$VolunteerNumber)
+meta_categorical <- PBMC_meta[, c(21,24,25,26,18,13,4)] 
+colnames(meta_categorical)<- c("Sample_Plate","Sentrix_ID","Sentrix_Position","Batch","Ethnicity","Allergen","VolunteerNumber")
+heat_scree_plot(Loadings, Importance)
+
+betas(de3_bmiq_PBMC)<-as.matrix(de3_PBMC_beta)
+save(de3_bmiq_PBMC,file = "de3_bmiq_PBMC_cell_corrected.RData")
+```
+
+
+## BAL Analysis: Houseman on BAL
+BAL had actual cell counts(although with missing data). We were able to test Houseman prediction on BAL and compare it to actual cell counts.
+- Has actual cell counts in Granulocytes, Lymphocytes, Monocytes(Monomacs) and Bronchial Epithelial Cells
+- 29sample+1 replicate= 21 samples with actual counts + impute [310-5,6,7]&[315-5,8]&[365-6,7,8]   
+- So far, Houseman seems to be doing a decent job on predicting Granulocytes, Lymphocytes, Monocytes(Monomacs)
+- missing 8 samples
+
+```{r}
+## pull out BAL
+BAL_meta<-filtermeta[filtermeta$SampleType=="BAL",]
+levels(BAL_meta)<- 1:nrow(BAL_meta)
+rownames(BAL_meta)<-1:nrow(BAL_meta)
+de3_bmiq_BAL<-de3_bmiq[,as.factor(sampleNames(de3_bmiq))%in%BAL_meta$SampleID]
+
+## compile the observed counts
+#### TO-DO  ###
+colnames(BAL_meta)
+colnames(BAL_meta)[colnames(BAL_meta)=="X1..Monomacs"] <- "Monomacs"
+colnames(BAL_meta)[colnames(BAL_meta)=="X2..Neutrophils"] <- "Neutrophils"
+colnames(BAL_meta)[colnames(BAL_meta)=="X3..Lymphocytes"] <- "Lymphocytes"
+colnames(BAL_meta)[colnames(BAL_meta)=="X4..Eosinophils"] <- "Eosinophils"
+colnames(BAL_meta)[colnames(BAL_meta)=="X5..BEC"] <- "BEC"
+colnames(BAL_meta)
+BAL_meta$Granulocytes<-BAL_meta$Neutrophils+BAL_meta$Eosinophils
+
+
+dim(de3_bmiq_BAL) # 791319  30
+save(de3_bmiq_BAL,file = "de3_bmiq_BAL.RData")
+save(BAL_meta,file = "BAL_meta.RData")
+
+## another heat scree on BAL
+BAL_full<-princomp(betas(de3_bmiq_BAL))
+Loadings<-as.data.frame(unclass(BAL_full$loadings))
+vars <- BAL_full$sdev^2
+Importance<-vars/sum(vars)
+
+colnames(BAL_meta)
+BAL_meta$Sentrix_ID<-as.factor(BAL_meta$Sentrix_ID)
+BAL_meta$Sentrix_Position<-as.factor(BAL_meta$Sentrix_Position)
+BAL_meta$Sample_Plate<-as.factor(BAL_meta$Sample_Plate)
+BAL_meta$Ethnicity<-as.factor(BAL_meta$Ethnicity)
+BAL_meta$Batch<-as.factor(BAL_meta$Batch)
+BAL_meta$AllergyTo<-as.factor(BAL_meta$AllergyTo)
+BAL_meta$VolunteerNumber<-as.factor(BAL_meta$VolunteerNumber)
+meta_categorical <- BAL_meta[, c(21,24,25,26,18,13,4)] 
+colnames(meta_categorical)<- c("Sample_Plate","Sentrix_ID","Sentrix_Position","Batch","Ethnicity","Allergen","VolunteerNumber")
+heat_scree_plot(Loadings, Importance)
+
+BALset = as.data.frame(betas(de3_bmiq_BAL))
+predictions<- ECC7(BALset)
+head(predictions)
+counts<- predictions$counts
+counts_BAL<-counts
+counts_BAL<-as.data.frame(counts_BAL)
+counts_BAL$Lymphocytes<- counts_BAL$CD8T +counts_BAL$CD4T+counts_BAL$NK+counts_BAL$Bcell
+save(counts_BAL,file="de3_BAL_cell counts.RData")
+
+## Rachel's code from "450k-Analysis/analysis scripts/drift_project/GEO/GSE61151_processing.R"
+betas<-as.data.frame(betas(de3_bmiq_BAL))
+diff <- as.data.frame(counts_BAL)
+
+diff$sampleID<-rownames(diff)
+diff_melt<- melt(diff)
+head(diff_melt)
+
+## use observed BAL cell count to confirm if Houseman is the right method
+ggplot(diff_melt, aes(variable, value, color=as.factor(variable)))+geom_point(shape=19, position = position_jitter(w = 0.2))+theme_bw()+xlab("Cell Type")+ylab("Cell Type Proportion")+scale_color_manual(values=c("#a50026", "#bd0026", "#e31a1c", "#fc4e2a", "#fd8d3c", "#feb24c"),guide=FALSE)
+
+## Extracting data from observed and expected and comparing
+colnames(BAL_meta)
+
+BAL_meta$LymphocytesProp <- BAL_meta$Lymphocytes/(BAL_meta$Lymphocytes+BAL_meta$Granulocytes+BAL_meta$Monomacs+BAL_meta$BEC)
+BAL_meta$GranulocytesProp <- BAL_meta$Granulocytes/(BAL_meta$Lymphocytes+BAL_meta$Granulocytes+BAL_meta$Monomacs+BAL_meta$BEC)
+BAL_meta$MonocytesProp <- BAL_meta$Monomacs/(BAL_meta$Lymphocytes+BAL_meta$Granulocytes+BAL_meta$Monomacs+BAL_meta$BEC)
+BAL_meta$BECProp<- BAL_meta$BEC/(BAL_meta$Lymphocytes+BAL_meta$Granulocytes+BAL_meta$Monomacs+BAL_meta$BEC)
+
+BAL_observed<-BAL_meta[,c("SampleID","LymphocytesProp","GranulocytesProp","MonocytesProp")]
+colnames(counts_BAL)
+BAL_expected<-counts_BAL[,c("Mono","Gran","Lymphocytes")]
+BAL_expected$SampleID<-rownames(BAL_expected)
+BAL_expected<-BAL_expected[,c(1,4,3,2)] ## match columns in both files
+dim(BAL_expected) #30 
+dim(BAL_observed) # 30
+length(intersect(BAL_expected$SampleID,BAL_observed$SampleID)) # 30
+
+BAL_obs_withoutNA<- na.omit(BAL_observed)  #22
+BAL_overlap_exp<- BAL_expected[BAL_expected$SampleID%in%BAL_obs_withoutNA$SampleID,] #22
+identical(as.character(BAL_obs_withoutNA$SampleID),as.character(BAL_overlap_exp$SampleID)) # True
+
+BAL_merged<- merge(BAL_obs_withoutNA,BAL_overlap_exp)
+
+p1<-ggplot(BAL_merged, aes(LymphocytesProp,Lymphocytes, color=as.factor(SampleID)))+geom_point(shape=19)+xlab("Lymphocytes Observed Proportion")+ylab(" Lymphocytes Expected Proportion(Houseman)")+coord_equal(ratio=1)
+p2<-ggplot(BAL_merged, aes(GranulocytesProp,Gran, color=as.factor(SampleID)))+geom_point(shape=19)+xlab("Granulocytes Observed Proportion")+ylab("Granulocytes Expected Proportion(Houseman)") + coord_equal(ratio=1)
+p3<-ggplot(BAL_merged, aes(MonocytesProp,Mono, color=as.factor(SampleID)))+geom_point(shape=19)+xlab("Monocytes Observed Proportion")+ylab("Monocytes Expected Proportion(Houseman)")+coord_equal(ratio=1)
+grid.arrange(p1,p2,p3,nrow=1)
+
+## Correlation for all Granulocytes 
+GranBAL<- BAL_merged[,c("SampleID","GranulocytesProp","Gran")]
+cor.test(GranBAL$GranulocytesProp,GranBAL$Gran, method = "pearson")  ## 0.799875 i prefer
+cor.test(GranBAL$GranulocytesProp,GranBAL$Gran, method = "spearman")  ## 0.5240157
+
+cor.test(BAL_merged$LymphocytesProp,BAL_merged$Lymphocytes)
+
+## instead of having proportions just correlate the actuals counts and Houseman 
+BAL_observed_counts<-na.omit(BAL_meta[,c("SampleID","Lymphocytes","Granulocytes","Monomacs")])
+colnames(BAL_observed_counts)[colnames(BAL_observed_counts)=="Lymphocytes"] <- "Lymphocytes_obs"
+colnames(BAL_observed_counts)[colnames(BAL_observed_counts)=="Granulocytes"] <- "Gran_obs"
+colnames(BAL_observed_counts)[colnames(BAL_observed_counts)=="Monomacs"] <- "Mono_obs"
+BAL_merged_actualcounts<-merge(BAL_observed_counts,BAL_overlap_exp)
+
+p1<-ggplot(BAL_merged_actualcounts, aes(Lymphocytes_obs,Lymphocytes, color=as.factor(SampleID)))+geom_point(shape=19)+xlab("Lymphocytes Observed Counts")+ylab(" Lymphocytes Expected Proportion(Houseman)")
+p2<-ggplot(BAL_merged_actualcounts, aes(Gran_obs,Gran, color=as.factor(SampleID)))+geom_point(shape=19)+xlab("Granulocytes Observed Counts")+ylab("Granulocytes Expected Proportion(Houseman)")
+p3<-ggplot(BAL_merged_actualcounts, aes(Mono_obs,Mono, color=as.factor(SampleID)))+geom_point(shape=19)+xlab("Monocytes Observed Counts")+ylab("Monocytes Expected Proportion(Houseman)")
+grid.arrange(p1,p2,p3,nrow=1)
+
+
+# PCA on all observed cell counts from BAL to check significancy of BEC
+## subset de3_bmiq_BAL into ones without NA
+head(colnames(de3_bmiq_BAL))
+de3_bmiq_BAL_withoutNA_betas<- betas(de3_bmiq_BAL)[,colnames(de3_bmiq_BAL)%in%BAL_BEC_merged$SampleID]
+dim(de3_bmiq_BAL_withoutNA_betas)  # 791319     22
+
+
+BAL_onlyWithCounts<-princomp(de3_bmiq_BAL_withoutNA_betas)
+Loadings<-as.data.frame(unclass(BAL_onlyWithCounts$loadings))
+vars <- BAL_onlyWithCounts$sdev^2
+Importance<-vars/sum(vars)
+
+
+BAL_meta_onlyWithCounts<-BAL_meta[BAL_meta$SampleID%in%BAL_BEC_merged$SampleID,]
+dim(BAL_meta_onlyWithCounts)  # 22 35
+
+BAL_meta_onlyWithCounts<-as.data.frame(BAL_meta_onlyWithCounts)
+colnames(BAL_meta_onlyWithCounts)
+BAL_meta_onlyWithCounts$VolunteerNumber<-as.factor(BAL_meta_onlyWithCounts$VolunteerNumber)
+#meta_categorical <- BAL_meta_onlyWithCounts[, c("VolunteerNumber","Sex","Ethnicity")] 
+#colnames(meta_categorical)<- c("VolunteerNumber","Sex","Ethnicity")
+
+meta_continuous<-BAL_meta_onlyWithCounts[,c("Granulocytes","Lymphocytes", "Monomacs","BEC")]
+colnames(meta_continuous)<- c("Granulocytes","Lymphocytes", "Monomacs","bronchial epithelium cells(BEC)")
+heat_scree_plot1(Loadings, Importance)
+
+
+```
+
+We also performed Alicia Smith(used for buccal), the result was far from satisfying, therefore we do not employ Alicia's method here.
+# the following two chunks of code is just BAL investigation, please deliberately ignore
+## PC1 against BEC counts (Meg's suggestion) 
+```{r}
+# perform PCA on BAL+unadjusted PBMC+BRUSH betas
+## just take out NASAL from de3_bmiq
+NASAL_meta<-filtermeta[filtermeta$SampleType=="NASAL",]
+NonNasal_meta<-filtermeta[!filtermeta$SampleID%in%NASAL_meta$SampleID,]
+de3_bmiq_nonNASAL<-de3_bmiq[,!(as.factor(sampleNames(de3_bmiq))%in%NASAL_meta$SampleID)]
+dim(de3_bmiq_nonNASAL) # 791319 188
+NonNasalBetas<-betas(de3_bmiq_nonNASAL)
+## performing PCA (without transposing it)  # GOAL: to compare the differences between transposing or not
+PCA_full<-prcomp(NonNasalBetas)
+PCA_full$x
+Loadings<-as.data.frame(PCA_full$rotation) #run next
+# plot PC1 against cell types
+## alter the code below ##
+identical(as.character(sampleNames(de3_bmiq_nonNASAL)),as.character(rownames(Loadings)))  #TRUE
+identical(as.character(NonNasal_meta$SampleID),as.character(rownames(Loadings))) #TRUE
+Loadings$TissueType<- NonNasal_meta$SampleType
+colnames(Loadings)
+
+
+Loadings$SampleID<-rownames(Loadings)
+PC1<-Loadings$PC1
+PC1<-as.data.frame(PC1)
+PC1$SampleID<-rownames(Loadings)
+
+## 2018-04-03 
+## plot correlation between actual BEC.count and predicted PC1 for the 22 samples with cell counts
+dim(PC1) # 188 2
+BEC_prop<-BAL_meta[,c("SampleID","BECProp")]
+BEC_prop<-na.omit(BEC_prop)
+identical(as.character(BEC_prop$SampleID),as.character(PC1_counts$SampleID))
+PC1_counts<-PC1[PC1$SampleID%in%BAL_obs_withoutNA$SampleID,]
+identical(as.character(BAL_BEC_obs$SampleID),as.character(PC1_counts$SampleID))
+PC1_full<-merge(BAL_BEC_obs,PC1_counts)
+PC1_full<-merge(BEC_prop,PC1_full)
+
+cor(PC1_full$PC1,PC1_full$BECProp)  # -0.5769447
+ggplot(PC1_full, aes(PC1,BECProp, color=as.factor(SampleID)))+geom_point(shape=19)+xlab("PC1 from predicted PCA")+ylab("actual BEC proportion from 22 samples")
+## end 
+
+##### PLOTS! PLOTS!! PLOTS!!!
+ggplot(Loadings, aes(PC1, PC2, color=as.factor(substr(rownames(Loadings),1,3))))+geom_point(shape=19)+theme_bw()+ylab("PC2 of unadj PBMC+BAL+BRUSH")+xlab("PC1")
+
+p1<-ggplot(Loadings, aes(PC1, PC2, color=as.factor(TissueType)))+geom_point(shape=19)+theme_bw()+ylab("PC2 of unadj PBMC+BAL+BRUSH")+xlab("PC1")
+
+p2<-ggplot(Loadings, aes(as.factor(TissueType), PC1, color=as.factor(TissueType)))+geom_point(shape=19,position = position_jitter(w = 0.2))+theme_bw()+xlab("Tissue Types")+ylab("PC1")
+grid.arrange(p1,p2,nrow=1)
+
+ggplot(Loadings, aes(as.factor(TissueType), PC2, color=as.factor(TissueType)))+geom_point(shape=19,position = position_jitter(w = 0.2))+theme_bw()+xlab("Tissue Types")+ylab("PC2")
+
+
+## 2018-04-3
+## PC1 against all four tissue types 
+PCA_full<- prcomp(betas(de3_bmiq))
+Loadings<-as.data.frame(PCA_full$rotation) 
+Loadings$TissueType<- filtermeta$SampleType
+
+p1<-ggplot(Loadings, aes(PC1, PC2, color=as.factor(TissueType)))+geom_point(shape=19)+theme_bw()+ylab("PC2")+xlab("PC1 for all four tissue types")
+
+p2<-ggplot(Loadings, aes(as.factor(TissueType), PC1, color=as.factor(TissueType)))+geom_point(shape=19,position = position_jitter(w = 0.2))+theme_bw()+xlab("Tissue Types")+ylab("PC1")
+grid.arrange(p1,p2,nrow=1)
+
+## end 
+
+## MAYBE WORK ON LATER
+## method 2 for PCA
+PCA_full_transpose<- prcomp(t(NonNasalBetas))
+Loadings_t<-as.data.frame(PCA_full_transpose$rotation)
+
+## As Meg suggested, correct for Houseman and check the heat scree for BEC 
+
+## Rachel's code from "450k-Analysis/analysis scripts/drift_project/GEO/GSE61151_processing.R"
+betas<-as.data.frame(betas(de3_bmiq_BAL))
+diff <- as.data.frame(counts_BAL)
+
+diff$sampleID<-rownames(diff)
+diff_melt<- melt(diff)
+
+# fit linear model for cell type effects on each probe in betas
+
+#PCA on the cell counts, then use PCs to correct the data.
+BAL.pcs<- prcomp(counts_BAL, center=T, scale=T)
+# Meg's original code
+betas.lm<-apply(betas, 1, function(x){
+  as.data.frame(BAL.pcs[[5]][colnames(betas),]) -> blood
+  lm(x~PC1+PC2+PC3+PC4+PC5+PC6, data=blood)
+})
+
+
+# extract matrix of residuals from resulting linear models
+residuals <- t(sapply(betas.lm, function(x)residuals(summary(x))))
+
+# add the residuals of each regression model to the mean methylation value of each probe (mean across all samples) to obtain the “adjusted” methylation data.
+adj.residuals <- residuals+matrix(apply(betas, 1, function(x) mean(as.numeric(x), na.rm=T)), nrow = nrow(residuals), ncol = ncol(residuals))
+
+de3_BAL_beta<-adj.residuals
+save(de3_BAL_beta,file="de3BAL_beta_CellCorrectedForHouseman.RData")
+
+
+## another heat scree
+## only do heat scree on the samples with actual cell counts
+de3_BAL_beta_onlyWithCounts<-de3_BAL_beta[,colnames(de3_BAL_beta)%in%BAL_meta_onlyWithCounts$SampleID]
+BAL_full<-princomp(de3_BAL_beta_onlyWithCounts)  
+Loadings<-as.data.frame(unclass(BAL_full$loadings))
+vars <- BAL_full$sdev^2
+Importance<-vars/sum(vars)
+
+BAL_meta_onlyWithCounts<-BAL_meta[BAL_meta$SampleID%in%BAL_obs_withoutNA$SampleID,]
+meta_continuous<-BAL_meta_onlyWithCounts[,c("Granulocytes","Lymphocytes", "Monomacs","BEC")]
+colnames(meta_continuous)<- c("Granulocytes","Lymphocytes", "Monomacs","bronchial epithelium cells(BEC)")
+heat_scree_plot1(Loadings, Importance)
+## Result: BEC is showing up on PC5, accounting for ~7.5% of the variance. Everything else has a p-value>0.05.
+
+
+## Visualize PC5: shows nothing significant 
+ggplot(Loadings, aes(as.factor(substr(rownames(Loadings),1,3)), Comp.5, color=as.factor(substr(rownames(Loadings),1,3))))+geom_point(shape=19)+theme_bw()+xlab("individuals")+ylab("PC5")
+ggplot(Loadings, aes(as.factor(substr(rownames(Loadings),1,3)), Comp.4, color=as.factor(substr(rownames(Loadings),1,3))))+geom_point(shape=19)+theme_bw()+xlab("individuals")+ylab("PC4")
+
+```
+## Another approach to confirm that the heat scree plot for four cell type isn't weird 
+## exlcude BEC from the correction, only using the actual cell counts for three cell types
+```{r}
+## correct beta using the actual cell counts
+de3_BAL_twentytwo<-de3_bmiq_BAL[,(as.factor(sampleNames(de3_bmiq_BAL))%in%BAL_meta_onlyWithCounts$SampleID)]
+dim(de3_BAL_twentytwo)   # 791319       22 
+betas<-as.data.frame(betas(de3_BAL_twentytwo))
+####################### pick up from here 2018-03-26 #############
+## counts_BAL  should be replaced by BAL_obs_withoutNA, fix the levels for the data frame
+
+rownames(BAL_obs_withoutNA)<-BAL_obs_withoutNA$SampleID
+## now just remove the SampleID column
+colnames(BAL_obs_withoutNA)
+BAL_obs_withoutNA<-BAL_obs_withoutNA[,c("LymphocytesProp","GranulocytesProp","MonocytesProp")]
+levels(BAL_obs_withoutNA)<-nrow(BAL_obs_withoutNA)
+
+diff <- as.data.frame(BAL_obs_withoutNA)
+diff$sampleID<-rownames(diff)
+diff_melt<- melt(diff)
+
+# fit linear model for cell type effects on each probe in betas
+#PCA on the cell counts, then use PCs to correct the data.
+BAL.pcs<- prcomp(BAL_obs_withoutNA, center=T, scale=T) 
+# Meg's original code
+betas.lm<-apply(betas, 1, function(x){
+  as.data.frame(BAL.pcs[[5]][colnames(betas),]) -> blood
+  lm(x~PC1+PC2+PC3, data=blood)
+})
+
+
+# extract matrix of residuals from resulting linear models
+residuals <- t(sapply(betas.lm, function(x)residuals(summary(x))))
+
+# add the residuals of each regression model to the mean methylation value of each probe (mean across all samples) to obtain the “adjusted” methylation data.
+adj.residuals <- residuals+matrix(apply(betas, 1, function(x) mean(as.numeric(x), na.rm=T)), nrow = nrow(residuals), ncol = ncol(residuals))
+
+de3_BAL_beta_actualcountstwentytwo<-adj.residuals
+save(de3_BAL_beta_actualcountstwentytwo,file="de3BAL_beta_CellCorrectedWithActualCounts.RData")
+
+# another PCA/heat scree to see if BEC is still significant 
+BAL_full<-princomp(de3_BAL_beta_actualcountstwentytwo)  
+Loadings<-as.data.frame(unclass(BAL_full$loadings))
+vars <- BAL_full$sdev^2
+Importance<-vars/sum(vars)
+
+BAL_meta_onlyWithCounts<-BAL_meta[BAL_meta$SampleID%in%BAL_obs_withoutNA$SampleID,]
+meta_continuous<-BAL_meta_onlyWithCounts[,c("Granulocytes","Lymphocytes", "Monomacs","BEC")]
+colnames(meta_continuous)<- c("Granulocytes","Lymphocytes", "Monomacs","bronchial epithelium cells(BEC)")
+heat_scree_plot1(Loadings, Importance)
+```
+
+
+
+
+
+Moving on!!!
+
+# 7. SVA on NASAL and BRUSH
+```{r}
+## subset meta data for both tissues and save file 
+NASAL_meta<-filtermeta[filtermeta$SampleType=="NASAL",]
+save(NASAL_meta,file = "NASAL_meta.RData")
+
+BRUSH_meta<-filtermeta[filtermeta$SampleType=="BRUSH",]
+save(BRUSH_meta,file = "BRUSH_meta.RData")
+```
+
+# 7.1 SVA NASAL
+```{r}
+## make heat scree and see what's going onnnn
+## take de3_bmiq_NASAL
+
+de3_bmiq_NASAL<-de3_bmiq[,as.factor(sampleNames(de3_bmiq))%in%NASAL_meta$SampleID]
+dim(betas(de3_bmiq_NASAL)) # 791319     37 (including two replicates)
+
+NASAL_full<-princomp(betas(de3_bmiq_NASAL))
+Loadings<-as.data.frame(unclass(NASAL_full$loadings))
+vars <- NASAL_full$sdev^2
+Importance<-vars/sum(vars)
+
+colnames(NASAL_meta)
+NASAL_meta$Sentrix_ID<-as.factor(NASAL_meta$Sentrix_ID)
+NASAL_meta$Sentrix_Position<-as.factor(NASAL_meta$Sentrix_Position)
+NASAL_meta$Sample_Plate<-as.factor(NASAL_meta$Sample_Plate)
+NASAL_meta$Ethnicity<-as.factor(NASAL_meta$Ethnicity)
+NASAL_meta$Batch<-as.factor(NASAL_meta$Batch)
+NASAL_meta$AllergyTo<-as.factor(NASAL_meta$AllergyTo)
+NASAL_meta$VolunteerNumber<-as.factor(NASAL_meta$VolunteerNumber)
+meta_categorical <- NASAL_meta[, c(24,25,21,18,26,13,4)] 
+colnames(meta_categorical)<- c("Sentrix_ID","Sentrix_Position","Sample_Plate","Ethnicity","Batch","Allergen","VolunteerNumber")
+heat_scree_plot(Loadings, Importance)
+
+## Conclusion: seems like technical variation isn't too much of a worry now
+##            PC1 is VolunteerNumber and accounts for 80% of the total variation
+
+## SVA, courtesy of Rachel's code on GitHub
+beta<-as.data.frame(betas(de3_bmiq_NASAL))
+
+library(ggplot2)
+library(reshape)
+library(RCurl)
+
+## need Mval for SVA
+Mval<-function(beta) log2(beta/(1-beta))
+mval = apply(as.data.frame(beta), 1, Mval) # need mvalues for combat
+mval = as.data.frame(mval)
+mval = t(mval)
+
+mval_variable = apply(as.data.frame(beta), 1, Mval) # need mvalues for combat
+mval_variable = as.data.frame(mval_variable)
+mval_variable = t(mval_variable)
+
+#Surrogate variable analysis: https://www.bioconductor.org/packages/release/bioc/html/sva.html
+library(sva)
+
+
+#Null model matrix must be nested in the full model matrix
+mod = model.matrix(~NASAL_meta$VolunteerNumber)
+mod0 = model.matrix(~1, data.frame(NASAL_meta$VolunteerNumber))
+
+## surrogates
+svobj = sva(as.matrix(mval_variable),mod,mod0)
+sv_unsup_ind<-svobj$sv
+save(sv_unsup_ind,file= "NASAL_SVA.RData")
+
+## we only want to correct for SV that is tissue related 
+## investigate which SV is tissue type
+
+## plot individual by SV1
+sv_unsup_ind<-as.data.frame(sv_unsup_ind)
+sv_unsup_ind2<-as.data.frame(sv_unsup_ind2)
+p1<-ggplot(sv_unsup_ind, aes(as.factor(NASAL_meta$VolunteerNumber), V1, color=as.factor(NASAL_meta$VolunteerNumber)))+geom_point(shape=19)+theme_bw()+xlab("Nasal Individual")+ylab("SV1")+theme(legend.position="none")
+
+
+p2<-ggplot(sv_unsup_ind, aes(as.factor(NASAL_meta$VolunteerNumber), V2, color=as.factor(NASAL_meta$VolunteerNumber)),show.legend=F)+geom_point(shape=19)+theme_bw()+xlab("Nasal Individual")+ylab("SV2")+theme(legend.position="none")
+
+p3<-ggplot(sv_unsup_ind, aes(as.factor(NASAL_meta$VolunteerNumber), V3, color=as.factor(NASAL_meta$VolunteerNumber)),show.legend=F)+geom_point(shape=19)+theme_bw()+xlab("Nasal Individual")+ylab("SV3")+theme(legend.position="none")
+
+p4<-ggplot(sv_unsup_ind, aes(as.factor(NASAL_meta$VolunteerNumber), V4, color=as.factor(NASAL_meta$VolunteerNumber)),show.legend=F)+geom_point(shape=19)+theme_bw()+xlab("Nasal Individual")+ylab("SV4")+theme(legend.position="none")
+grid.arrange(p1,p2,p3,p4,nrow=2)
+
+## Correction 
+##### FIGURE OUT THE CODE BELOW #####
+rownames(sv_unsup_ind)<-colnames(betas(de3_bmiq_NASAL))
+identical(as.character(rownames(sv_unsup_ind)),as.character(NASAL_meta$SampleID)) #TRUE
+## problem here!! how many SV's should be included?
+#betas.lm <- apply(betas(de3_bmiq_NASAL), 1, function(x){
+#  lm(x~V1+V2+V3+V4,data=sv_unsup_ind) 
+#})
+residuals <- t(sapply(betas.lm, function(x)residuals(summary(x))))
+colnames(residuals) <- colnames(betas(de3_bmiq_NASAL)) # re-name residuals columns with sample names
+adj.residuals.sva.unsup.ind <- residuals+matrix(apply(betas(de3_bmiq_NASAL), 1, mean), nrow = nrow(residuals), ncol = ncol(residuals))
+save(adj.residuals.sva.unsup.ind,file="adj.residuals_sva.unsup.ind.Rdata")
+
+rm(adj.residuals.sva.unsup.ind)
+rm(betas.lm)
+gc()
+
+```
+## 7.1.1 SV against individual seems oddly linear *investigate*
+```{r}
+# Rachel suggested plotting NASAL PC1 against SV1/individual 
+Loadings$SampleID<-rownames(Loadings)
+Loadings<-Loadings[,c("PC1","TissueType","SampleID")]
+NASAL_PC<-Loadings[Loadings$TissueType=="NASAL",]
+sv_unsup_ind$SampleID<-rownames(sv_unsup_ind)
+identical(NASAL_PC$SampleID,sv_unsup_ind$SampleID)
+NASAL_PC_SV<-merge(NASAL_PC,sv_unsup_ind)
+
+## NASAL_PC1_SV!.pdf
+ggplot(NASAL_PC_SV, aes(V1, PC1, color=as.factor(substr(SampleID,1,3))))+theme_bw()+xlab("NASAL SV1")+ylab("PC1")+geom_text(aes(label=substr(SampleID,1,3)))
+
+## just adding text 
+Loadings$SampleID<-rownames(Loadings)
+p1<-ggplot(Loadings, aes(PC1, PC2, color=as.factor(TissueType)))+theme_bw()+ylab("PC2")+xlab("PC1 for all four tissue types")+geom_text(aes(label=substr(SampleID,1,3)))
+
+p2<-ggplot(Loadings, aes(as.factor(TissueType), PC1, color=as.factor(TissueType)))+theme_bw()+xlab("Tissue Types")+ylab("PC1")+geom_text(aes(label=substr(SampleID,1,3)),position = position_jitter(w = 0.2))
+grid.arrange(p1,p2,nrow=1)
+
+
+```
+
+## 7.1.2 Houseman on NASAL and then regress out the blood like variations 
+```{r}
+de3_bmiq_NASAL<-de3_bmiq[,sampleNames(de3_bmiq)%in%NASAL_meta$SampleID]
+length(intersect(sampleNames(de3_bmiq_NASAL),NASAL_meta$SampleID)) # 37
+NASALset = as.data.frame(betas(de3_bmiq_NASAL))
+source("/home/cyou/DE3/ECC7.R")
+predictions<- ECC7(NASALset)
+counts_nasal<- predictions$counts
+save(counts_nasal,file="de3_NASAL_cell counts_ECC7.RData")
+```
+
+# 7.2 SVA BRUSH
+```{r}
+## make heat scree and see what's going onnnn
+## take de3_bmiq_BRUSH
+
+de3_bmiq_BRUSH<-de3_bmiq[,as.factor(sampleNames(de3_bmiq))%in%BRUSH_meta$SampleID]
+dim(betas(de3_bmiq_BRUSH)) # 791319     50 /52 NOT BAD!
+
+BRUSH_full<-princomp(betas(de3_bmiq_BRUSH))
+Loadings<-as.data.frame(unclass(BRUSH_full$loadings))
+vars <- BRUSH_full$sdev^2
+Importance<-vars/sum(vars)
+
+BRUSH_meta$Sentrix_ID<-as.factor(BRUSH_meta$Sentrix_ID)
+BRUSH_meta$Sentrix_Position<-as.factor(BRUSH_meta$Sentrix_Position)
+BRUSH_meta$Sample_Plate<-as.factor(BRUSH_meta$Sample_Plate)
+BRUSH_meta$Ethnicity<-as.factor(BRUSH_meta$Ethnicity)
+BRUSH_meta$Batch<-as.factor(BRUSH_meta$Batch)
+BRUSH_meta$AllergyTo<-as.factor(BRUSH_meta$AllergyTo)
+BRUSH_meta$VolunteerNumber<-as.factor(BRUSH_meta$VolunteerNumber)
+BRUSH_meta$Sex<-as.factor(BRUSH_meta$Sex)
+BRUSH_meta$Exposure<-as.factor(BRUSH_meta$Exposure)
+BRUSH_meta$ExposureOrder<-as.factor(BRUSH_meta$ExposureOrder)
+meta_categorical <- BRUSH_meta[, c(24,25,21,18,26,13,4,5,7,10)] 
+colnames(meta_categorical)<- c("Sentrix_ID","Sentrix_Position","Sample_Plate","Ethnicity","Batch","Allergen","VolunteerNumber","Sex","Exposure","Exposure Order")
+heat_scree_plot(Loadings, Importance)
+
+### this plot is so weird, need to ask for more opinions: why is PC1 not "siginificant" and only explains for 40% of the variation 
+
+
+## SVA, courtesy of Rachel's code on GitHub
+beta2<-as.data.frame(betas(de3_bmiq_BRUSH))
+
+## need Mval for SVA
+Mval<-function(beta) log2(beta/(1-beta))
+mval = apply(as.data.frame(beta2), 1, Mval) # need mvalues for combat
+mval = as.data.frame(mval)
+mval = t(mval)
+
+mval_variable = apply(as.data.frame(beta2), 1, Mval) # need mvalues for combat
+mval_variable = as.data.frame(mval_variable)
+mval_variable = t(mval_variable)
+
+#Surrogate variable analysis: https://www.bioconductor.org/packages/release/bioc/html/sva.html
+library(sva)
+
+#Null model matrix must be nested in the full model matrix
+mod = model.matrix(~BRUSH_meta$VolunteerNumber)
+mod0 = model.matrix(~1, data.frame(BRUSH_meta$VolunteerNumber))
+
+## surrogates
+svobj_BRUSH = sva(as.matrix(mval_variable),mod,mod0)
+sv_unsup_ind_BRUSH<-svobj_BRUSH$sv
+save(sv_unsup_ind_BRUSH,file="BRUSH_SVA.RData")
+dim(sv_unsup_ind_BRUSH) # 50 6
+
+## Checking for SV's that are related to tissue types
+## plot individual by SV1
+sv_unsup_ind_BRUSH<-as.data.frame(sv_unsup_ind_BRUSH)
+rownames(sv_unsup_ind_BRUSH)<-colnames(betas(de3_bmiq_BRUSH))
+p1<-ggplot(sv_unsup_ind_BRUSH, aes(as.factor(BRUSH_meta$VolunteerNumber), V1, color=as.factor(BRUSH_meta$VolunteerNumber)))+geom_point(shape=19)+theme_bw()+xlab("BRUSH Individual")+ylab("SV1")+theme(legend.position="none")
+
+
+p2<-ggplot(sv_unsup_ind_BRUSH, aes(as.factor(BRUSH_meta$VolunteerNumber), V2, color=as.factor(BRUSH_meta$VolunteerNumber)),show.legend=F)+geom_point(shape=19)+theme_bw()+xlab("Brush Individual")+ylab("SV2")+theme(legend.position="none")
+
+p3<-ggplot(sv_unsup_ind_BRUSH, aes(as.factor(BRUSH_meta$VolunteerNumber), V3, color=as.factor(BRUSH_meta$VolunteerNumber)),show.legend=F)+geom_point(shape=19)+theme_bw()+xlab("Brush Individual")+ylab("SV3")+theme(legend.position="none")
+
+p4<-ggplot(sv_unsup_ind_BRUSH, aes(as.factor(BRUSH_meta$VolunteerNumber), V4, color=as.factor(BRUSH_meta$VolunteerNumber)),show.legend=F)+geom_point(shape=19)+theme_bw()+xlab("Brush Individual")+ylab("SV4")+theme(legend.position="none")
+
+p5<-ggplot(sv_unsup_ind_BRUSH, aes(as.factor(BRUSH_meta$VolunteerNumber), V5, color=as.factor(BRUSH_meta$VolunteerNumber)),show.legend=F)+geom_point(shape=19)+theme_bw()+xlab("Brush Individual")+ylab("SV5")+theme(legend.position="none")
+
+p6<-ggplot(sv_unsup_ind_BRUSH, aes(as.factor(BRUSH_meta$VolunteerNumber), V6, color=as.factor(BRUSH_meta$VolunteerNumber)),show.legend=F)+geom_point(shape=19)+theme_bw()+xlab("Brush Individual")+ylab("SV6")+theme(legend.position="none")
+grid.arrange(p1,p2,p3,p4,p5,p6,nrow=2)
+
+
+## Correction 
+##### FIGURE OUT THE CODE BELOW #####
+rownames(sv_unsup_ind_BRUSH)<-colnames(betas(de3_bmiq_BRUSH))
+identical(as.character(rownames(sv_unsup_ind_BRUSH)),as.character(BRUSH_meta$SampleID)) #TRUE
+## problem here!! how many SV's should be included?
+#betas.lm <- apply(betas(de3_bmiq_BRUSH), 1, function(x){
+#  lm(x~V1+V2+V3+V4,data=sv_unsup_ind_BRUSH) 
+#})
+residuals <- t(sapply(betas.lm, function(x)residuals(summary(x))))
+colnames(residuals) <- colnames(betas(de3_bmiq_NASAL)) # re-name residuals columns with sample names
+adj.residuals.sva.unsup.ind.BRUSH <- residuals+matrix(apply(betas(de3_bmiq_BRUSH), 1, mean), nrow = nrow(residuals), ncol = ncol(residuals))
+save(adj.residuals.sva.unsup.ind.BRUSH,file="adj.residuals_sva.unsup.ind.BRUSH.Rdata")
+
+rm(adj.residuals.sva.unsup.ind.BRUSH)
+rm(betas.lm)
+gc()
+
+```
+# Final Product of BRUSH cell deconvolution
+## 7.2.1 Post Lab Meeting- BRUSH and PBMC SVA
+```{r}
+PBMC_meta<-filtermeta[filtermeta$SampleType=="PBMC",]
+save(PBMC_meta,file = "PBMC_meta.RData")
+
+BP_meta<-rbind(PBMC_meta,BRUSH_meta)
+de3_bmiq_BP<-de3_bmiq[,sampleNames(de3_bmiq)%in%BP_meta$SampleID]
+
+
+## reorder BP_meta$SampleID
+ for (k in 1:length(sampleNames(de3_bmiq_BP))) {
+  for (i in 1:nrow(BP_meta)) {
+    if(BP_meta$SampleID[i]== sampleNames(de3_bmiq_BP)[k]){
+      temp<-BP_meta[k,]
+      BP_meta[k,]<-BP_meta[i,]
+      BP_meta[i,]<-temp
+    }
+  }
+}
+save(BP_meta,de3_bmiq_BP,file="BRUSH and PBMC.RData")
+
+## sup or unsup(?) SVA
+## SVA, courtesy of Rachel's code on GitHub
+beta<-as.data.frame(betas(de3_bmiq_BP))
+
+## need Mval for SVA
+mval = apply(as.data.frame(beta), 1, Mval) # need mvalues for combat
+mval = as.data.frame(mval)
+mval = t(mval)
+
+mval_variable = apply(as.data.frame(beta), 1, Mval) # need mvalues for combat
+mval_variable = as.data.frame(mval_variable)
+mval_variable = t(mval_variable)
+
+#Surrogate variable analysis: https://www.bioconductor.org/packages/release/bioc/html/sva.html
+library(sva)
+
+#Null model matrix must be nested in the full model matrix
+mod = model.matrix(~BP_meta$VolunteerNumber)
+mod0 = model.matrix(~1, data.frame(BP_meta$VolunteerNumber))
+
+## surrogates
+svobj = sva(as.matrix(mval_variable),mod,mod0)
+sv_unsup_ind_BP<-svobj$sv
+save(sv_unsup_ind_BP,file="BRUSH and PBMC SVA.RData")
+dim(sv_unsup_ind_BP) # 158 4
+
+## Checking for SV's that are related to tissue types
+## plot individual by SV1
+sv_unsup_ind_BP<-as.data.frame(sv_unsup_ind_BP)
+rownames(sv_unsup_ind_BP)<-colnames(betas(de3_bmiq_BP))
+
+## plot 
+## plot SV1 against SV2 and colour by Individual
+ggplot(sv_unsup_ind_BP, aes(V1, V2, color=as.factor(BP_meta$VolunteerNumber)))+geom_point(shape=19)+theme_bw()+xlab("SV1")+ylab("SV2")
+
+## plot SV1 against SV2 and colour by Tissue Type
+ggplot(sv_unsup_ind_BP, aes(V1, V2, color=as.factor(BP_meta$SampleType)))+geom_point(shape=19)+theme_bw()+xlab("SV1")+ylab("SV2")
+
+## next step idea: for each individual, the score of BRUSH SV1 minus the score of PBMC SV1 forms a model matrix, use that to correct for BRUSH
+## only take out BRUSH's SV1 scores and merge it into the methylation data or use it as a covariance idk...
+sv_unsup_ind_BP$SampleID<-rownames(sv_unsup_ind_BP)
+SV1_BP<-sv_unsup_ind_BP[,c("V1","SampleID")]
+SV1_BP<-SV1_BP[SV1_BP$SampleID%in%BRUSH_meta$SampleID,]
+save(SV1_BP,file = "SV1_scores_BRUSH.RData")
+## correct usng SV1
+diff <- as.data.frame(SV1_BP)
+identical(colnames(betas(de3_bmiq_BRUSH)), rownames(diff)) # Should be TRUE
+betas <- betas(de3_bmiq_BRUSH)
+
+avebeta.lm<-apply(betas, 1, function(x){
+  brush <- diff[colnames(betas),]
+  lm(x~V1, data=brush) ## i feel like this line doesn't make sense at this point
+})
+
+## extract matrix of residuals from resulting linear models
+residuals <- t(sapply(avebeta.lm, function(x)residuals(summary(x))))
+colnames(residuals) <- colnames(betas) # re-name residuals columns with sample names
+
+## add the residuals of each regression model to the mean methylation value of each probe (mean across all samples) to obtain the “adjusted” methylation data.
+adj.residuals_brush <- residuals+matrix(apply(betas, 1, mean), nrow = nrow(residuals), ncol = ncol(residuals))
+head(adj.residuals_brush)
+save(adj.residuals_brush,file ="adjusted_brush_data.RData")
+
+# To make sure we do not induce any NAs into the dataset when we convert the beta values back M-values (by log2 transformation), we need to ensure we do not have any corrected beta values that are greater or equal to zero or any beta values that are greater than 1.
+
+adj.residuals_brush[adj.residuals_brush<=0] <- 0.001 # convert any values that are less than or equal to zero to 0.001
+adj.residuals_brush[adj.residuals_brush>1] <- 0.999 # convert any values that are greater than 1 to 0.999
+
+## compare the before and after adjustment beta value distribution
+### before
+## BetaValue distribtuions combined into a format ggplot can understand 
+Beta_sample_melted<- melt(betas(de3_bmiq_BRUSH))
+head(colnames(Beta_sample_melted))
+#add meta
+Beta_Plot<-merge(Beta_sample_melted,BRUSH_meta,by.x="X2" ,by.y="SampleID")
+
+ggplot(Beta_Plot, aes(value, group=X2,color=as.factor(substr(Beta_Plot$X2,1,3))))+ geom_density(size=1)+theme_bw()
+
+### after
+## BetaValue distribtuions combined into a format ggplot can understand 
+Beta_sample_melted<- melt(adj.residuals_brush)
+#add meta
+Beta_Plot_adj<-merge(Beta_sample_melted,BRUSH_meta,by.x="X2" ,by.y="SampleID")
+
+ggplot(Beta_Plot_adj, aes(value, group=X2,color=as.factor(substr(Beta_Plot_adj$X2,1,3))))+ geom_density(size=1)+theme_bw()
+save(adj.residuals_brush,file ="adjusted_brush_data.RData")
+
+## maybe replot the four tissue against PC1 stuff and see where brush falls into 
+```
+"adj.residuals_brush" will be used in the BRUSH analysis script.

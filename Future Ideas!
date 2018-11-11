@@ -1,0 +1,12 @@
+This is a list dedicated to the ideas that I think is cool but didn't have enough time/knowledge to work on. 
+For those who are interested, feel free to pick it up from here: 
+
+- use PBMC 9 individuals to study the intra-individual variance
+- combine Anke's genetic risk score with DE3 
+- Blood&NASAL&BRUSH sth like Rachel's BECon
+- NASAL is just an interesting tissue to look at, cell deconvolution?
+- http://go.galegroup.com/ps/i.do?p=HRCA&u=ubcolumbia&id=GALE%7CA325307357&v=2.1&it=r&sid=summon only look at the CpGs associated with the genes involved in the asthma pathway
+- tbc
+
+Things I should do on the side: 
+- add UCSC gene names to the volcano plots instead of CpG. (CpG sites will still printed in the console)
