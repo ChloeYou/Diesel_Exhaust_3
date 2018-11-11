@@ -4,7 +4,7 @@
 - [Preprocessing](https://github.com/kobor-lab/Co-op_Projects/blob/master/ChloeYou/DE3/preprocessing.Rmd)
 - [ComBat & Cell Deconvolution](https://github.com/kobor-lab/Co-op_Projects/blob/master/ChloeYou/DE3/ComBat%26CellDeconvolution.Rmd)
 - [BRUSH Analysis](https://github.com/kobor-lab/Co-op_Projects/blob/master/ChloeYou/DE3/BRUSH%20analysis.Rmd)
-- PBMC Analysis will go here (found some fun stuff, looking into it, might take longer to upload this script)
+- [PBMC Analysis](https://github.com/ChloeYou/Diesel_Exhaust_3/blob/master/PBMC%20analysis.Rmd)
 - [Attempt at NASAL cell type correction](https://github.com/kobor-lab/Co-op_Projects/blob/master/ChloeYou/DE3/NASAL%20analysis.Md)
 
 ### BCCHRI Summer Student Research Program 2018
